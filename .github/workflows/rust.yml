@@ -8,11 +8,23 @@ on:
 
 jobs:
   build:
-    runs-on: [vispace-release]
+    runs-on: vispace-release
     steps:
       - uses: actions/checkout@v4
-      - name: Install browser target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libdbus-1-dev libudev-dev libxkbcommon-dev libwayland-dev
+      - name: Set up Rust and the browser target
+        shell: bash
+        run: |
+          if ! command -v rustup >/dev/null && [[ ! -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]]; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          echo "$cargo_bin" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
       - name: Check desktop targets
         run: cargo check --locked --all-targets
       - name: Check browser build
