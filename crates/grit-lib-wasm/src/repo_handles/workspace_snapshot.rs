@@ -1,0 +1,69 @@
+//! Workspace snapshot capture/restore for undo logs.
+
+use crate::error::Result;
+use crate::porcelain::workspace_snapshot::{
+    capture_workspace_snapshot, pin_workspace_snapshot, restore_workspace_snapshot,
+    unpin_workspace_snapshot, WorkspaceCaptureOptions, WorkspaceRestoreOptions, WorkspaceSnapshot,
+};
+use crate::progress::{CancelToken, ProgressSink};
+use crate::repo::Repository;
+
+/// Capture and restore full workspace state (index stages, worktree, refs, operation sentinels).
+#[derive(Debug, Copy, Clone)]
+pub struct RepositoryWorkspaceSnapshot<'repo> {
+    repo: &'repo Repository,
+}
+
+impl<'repo> RepositoryWorkspaceSnapshot<'repo> {
+    pub(crate) fn new(repo: &'repo Repository) -> Self {
+        Self { repo }
+    }
+
+    /// Borrow the underlying repository.
+    #[must_use]
+    pub fn repository(&self) -> &'repo Repository {
+        self.repo
+    }
+
+    /// Capture the current workspace without mutating the repository.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from workspace capture.
+    pub fn capture(&self, options: &WorkspaceCaptureOptions) -> Result<WorkspaceSnapshot> {
+        capture_workspace_snapshot(self.repo, options)
+    }
+
+    /// Restore a snapshot produced by [`Self::capture`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from workspace restore.
+    pub fn restore(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        options: &WorkspaceRestoreOptions,
+        progress: &mut dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        restore_workspace_snapshot(self.repo, snapshot, options, progress, cancel)
+    }
+
+    /// Pin `snapshot.worktree_tree` so it survives garbage collection until [`Self::unpin`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from workspace snapshot pinning.
+    pub fn pin(&self, snapshot: &WorkspaceSnapshot, caller_id: &str) -> Result<()> {
+        pin_workspace_snapshot(self.repo, snapshot, caller_id)
+    }
+
+    /// Remove a workspace snapshot pin for `caller_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from workspace snapshot unpinning.
+    pub fn unpin(&self, caller_id: &str) -> Result<()> {
+        unpin_workspace_snapshot(self.repo, caller_id)
+    }
+}

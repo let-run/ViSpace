@@ -1,0 +1,435 @@
+//! Verbatim pack reuse for bitmap-accelerated upload-pack (streaming PACK v2).
+//!
+//! Pack reuse is internal to upload-pack; there is no separate public embedder API.
+
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::bitmap_walk::ReachableSet;
+use crate::error::{Error, Result};
+use crate::ewah_bitmap::Bitmap;
+use crate::midx::{read_midx_btmp_ranges, read_midx_pack_idx_names, read_midx_preferred_idx_name};
+use crate::objects::ObjectId;
+use crate::pack::{
+    parse_pack_object_header, read_local_pack_indexes_cached, read_pack_bytes_cached,
+    read_packed_delta_dependency, PackedDeltaDependency, PackedType,
+};
+use crate::pack_index::PackIndex;
+use crate::pack_map::PackData;
+use crate::pack_object_select::{
+    included_tag_chains, try_bitmap_reachable_for_upload, TagCandidate,
+};
+use crate::pack_objects::{write_delta_pack_stream, PackBuildOptions, PackProgress, PackStats};
+use crate::repo::Repository;
+use crate::rev_list::ObjectFilter;
+
+struct BitmappedPack {
+    idx: Arc<PackIndex>,
+    pack_bytes: Arc<PackData>,
+    bitmap_pos: u32,
+    bitmap_nr: u32,
+}
+
+/// Counters updated while streaming reused pack bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReuseWriteStats {
+    /// Pack body bytes copied verbatim from an existing on-disk pack.
+    pub verbatim_reuse_bytes: u64,
+    /// Objects emitted via verbatim pack reuse.
+    pub verbatim_reuse_objects: u32,
+    /// Reused OFS deltas with remapped base offsets.
+    pub pack_ofs_fixup_objects: u32,
+    /// OFS deltas converted to REF deltas for thin packs.
+    pub pack_ref_from_ofs_objects: u32,
+}
+
+/// Active verbatim reuse context while streaming a pack body.
+pub struct StreamingReuse {
+    pack: BitmappedPack,
+    reuse_bits: Bitmap,
+    index: Arc<crate::pack_bitmap::BitmapIndex>,
+    stats: ReuseWriteStats,
+}
+
+impl StreamingReuse {
+    #[must_use]
+    pub(crate) fn take_stats(&mut self) -> ReuseWriteStats {
+        std::mem::take(&mut self.stats)
+    }
+
+    fn note_verbatim(&mut self, bytes: u64) {
+        self.stats.verbatim_reuse_bytes += bytes;
+        self.stats.verbatim_reuse_objects += 1;
+    }
+
+    fn note_ofs_fixup(&mut self) {
+        self.stats.pack_ofs_fixup_objects += 1;
+        self.stats.verbatim_reuse_objects += 1;
+    }
+
+    pub(crate) fn record_ofs_fixup(&mut self) {
+        self.note_ofs_fixup();
+    }
+
+    pub(crate) fn record_verbatim_zlib(&mut self, zlib_bytes: u64) {
+        self.stats.verbatim_reuse_bytes += zlib_bytes;
+    }
+}
+
+impl StreamingReuse {
+    fn new(pack: BitmappedPack, reuse_bits: Bitmap, send_set: &ReachableSet) -> Self {
+        Self {
+            pack,
+            reuse_bits,
+            index: Arc::clone(send_set.bitmap_index()),
+            stats: ReuseWriteStats::default(),
+        }
+    }
+
+    fn marks_reuse(&self, oid: &ObjectId) -> bool {
+        self.index
+            .position_of(oid)
+            .is_some_and(|pos| self.reuse_bits.get(pos as usize))
+    }
+
+    /// Stream a whole packed object to `w` when marked reusable.
+    pub(crate) fn try_write_whole(
+        &mut self,
+        w: &mut dyn Write,
+        oid: &ObjectId,
+        opts: &PackBuildOptions,
+    ) -> Result<Option<u64>> {
+        if !opts.reuse_objects || !self.marks_reuse(oid) {
+            return Ok(None);
+        }
+        let objects_dir = self
+            .pack
+            .idx
+            .idx_path
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| Error::CorruptObject("pack path layout".to_owned()))?;
+        let Some((bytes, start, end)) = crate::pack::packed_full_object_range(objects_dir, oid)?
+        else {
+            return Ok(None);
+        };
+        let n = write_whole_reused(w, &bytes[start..end])?;
+        self.note_verbatim(n);
+        Ok(Some(n))
+    }
+}
+
+/// Write a PACK stream to `w` using bitmap reachability and verbatim reuse when possible.
+///
+/// Returns [`None`] when reuse is unavailable (caller should stream via [`crate::pack_objects::PackObjects`]).
+#[allow(clippy::too_many_arguments)]
+pub fn try_write_streaming_pack(
+    repo: &Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    source_shallow: &HashSet<ObjectId>,
+    have_shallow: &HashSet<ObjectId>,
+    filter: Option<&ObjectFilter>,
+    opts: &PackBuildOptions,
+    progress: &mut dyn crate::progress::ProgressSink,
+    w: &mut dyn Write,
+) -> Result<Option<PackStats>> {
+    try_write_streaming_pack_including_tags(
+        repo,
+        wants,
+        haves,
+        source_shallow,
+        have_shallow,
+        filter,
+        &[],
+        opts,
+        progress,
+        w,
+        &crate::progress::CancelSignal::never(),
+    )
+}
+
+/// [`try_write_streaming_pack`] that also packs each of `include_tags` whose peeled
+/// object the bitmap send set holds (`include-tag`).
+///
+/// Added tags are planned like any object outside the reuse bitmap, so they are
+/// written whole and never duplicate an object the client asked for.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_write_streaming_pack_including_tags(
+    repo: &Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    source_shallow: &HashSet<ObjectId>,
+    have_shallow: &HashSet<ObjectId>,
+    filter: Option<&ObjectFilter>,
+    include_tags: &[TagCandidate],
+    opts: &PackBuildOptions,
+    progress: &mut dyn crate::progress::ProgressSink,
+    w: &mut dyn Write,
+    stop: &crate::progress::CancelSignal<'_>,
+) -> Result<Option<PackStats>> {
+    if !source_shallow.is_empty() || !have_shallow.is_empty() {
+        return Ok(None);
+    }
+    stop.poll()?;
+    let Some((send_set, peer_held)) =
+        try_bitmap_reachable_for_upload(repo.odb(), wants, haves, filter, source_shallow)?
+    else {
+        return Ok(None);
+    };
+    stop.poll()?;
+    let have_tips: HashSet<ObjectId> = haves.iter().copied().collect();
+    let index = send_set.bitmap_index();
+    let objects_dir = repo.odb().objects_dir();
+    let packs = resolve_bitmapped_packs(objects_dir, index, allow_multi_pack_reuse(repo))?;
+    if packs.is_empty() {
+        return Ok(None);
+    }
+    let Some(pack) = packs.into_iter().next() else {
+        return Ok(None);
+    };
+    let mut send: Vec<ObjectId> = send_set.iter_grouped_by_kind().collect();
+    send.extend(included_tag_chains(repo.odb(), include_tags, |oid| {
+        send_set.contains(oid)
+    })?);
+    let mut reporter = crate::pack_objects::PackBuildProgress::new(progress);
+    reporter.report(PackProgress::Enumerated { total: send.len() });
+
+    let send_bits = send_set.reuse_send_bits();
+    let reuse_bits = compute_reuse_bits(&pack, send_bits, &send_set, opts)?;
+
+    let blob_name_hashes =
+        crate::pack_object_select::name_hashes_for_send(index, &send, &HashSet::new());
+    let plan = crate::pack_objects::plan_deltas(
+        repo.odb(),
+        &send,
+        &have_tips,
+        Some(&peer_held),
+        opts,
+        &blob_name_hashes,
+        None,
+        stop,
+    )?;
+    reporter.report(PackProgress::PlannedDeltas);
+    stop.poll()?;
+
+    let mut reuse = StreamingReuse::new(pack, reuse_bits, &send_set);
+    let stats = write_delta_pack_stream(repo.odb(), &plan, opts, w, Some(&mut reuse))?;
+    Ok(Some(stats))
+}
+
+fn allow_multi_pack_reuse(_repo: &Repository) -> bool {
+    false
+}
+
+fn resolve_bitmapped_packs(
+    objects_dir: &Path,
+    index: &crate::pack_bitmap::BitmapIndex,
+    multi: bool,
+) -> Result<Vec<BitmappedPack>> {
+    let pack_dir = objects_dir.join("pack");
+    let btmp = read_midx_btmp_ranges(objects_dir)?;
+    let idx_names = read_midx_pack_idx_names(objects_dir).unwrap_or_default();
+    let indexes: HashMap<String, Arc<PackIndex>> = read_local_pack_indexes_cached(objects_dir)?
+        .into_iter()
+        .map(|idx| {
+            let stem = idx
+                .idx_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_owned();
+            (stem, idx)
+        })
+        .collect();
+
+    if !btmp.is_empty() {
+        let mut ranges: Vec<_> = btmp.into_iter().filter(|r| r.bitmap_nr > 0).collect();
+        if !multi {
+            if let Ok(pref) = read_midx_preferred_idx_name(objects_dir) {
+                let stem = pref.strip_suffix(".idx").unwrap_or(&pref);
+                if let Some(pos) = idx_names.iter().position(|n| n == &pref) {
+                    ranges.retain(|r| r.pack_id == pos as u32);
+                } else if indexes.contains_key(stem) {
+                    ranges.retain(|r| {
+                        idx_names
+                            .get(r.pack_id as usize)
+                            .is_some_and(|n| n.strip_suffix(".idx").unwrap_or(n) == stem)
+                    });
+                } else {
+                    ranges.truncate(1);
+                }
+            } else {
+                ranges.truncate(1);
+            }
+        }
+        let mut out = Vec::new();
+        for range in ranges {
+            let Some(name) = idx_names.get(range.pack_id as usize) else {
+                continue;
+            };
+            let stem = name.strip_suffix(".idx").unwrap_or(name);
+            let Some(idx) = indexes.get(stem) else {
+                continue;
+            };
+            let pack_bytes = read_pack_bytes_cached(&idx.pack_path)?;
+            out.push(BitmappedPack {
+                idx: Arc::clone(idx),
+                pack_bytes,
+                bitmap_pos: range.bitmap_pos,
+                bitmap_nr: range.bitmap_nr,
+            });
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+
+    let count = index.object_count();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if let Some(idx) = index.backing_pack_index() {
+        let pack_bytes = read_pack_bytes_cached(&idx.pack_path)?;
+        return Ok(vec![BitmappedPack {
+            idx,
+            pack_bytes,
+            bitmap_pos: 0,
+            bitmap_nr: count,
+        }]);
+    }
+    let mut with_bitmap: Vec<Arc<PackIndex>> = indexes
+        .values()
+        .filter(|idx| {
+            idx.idx_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| pack_dir.join(format!("{stem}.bitmap")).is_file())
+        })
+        .cloned()
+        .collect();
+    with_bitmap.sort_by_key(|idx| std::cmp::Reverse(idx.len()));
+    if let Some(idx) = with_bitmap.into_iter().next() {
+        let pack_bytes = read_pack_bytes_cached(&idx.pack_path)?;
+        return Ok(vec![BitmappedPack {
+            idx,
+            pack_bytes,
+            bitmap_pos: 0,
+            bitmap_nr: count,
+        }]);
+    }
+    Ok(Vec::new())
+}
+
+fn compute_reuse_bits(
+    pack: &BitmappedPack,
+    send_bits: &Bitmap,
+    send_set: &ReachableSet,
+    opts: &PackBuildOptions,
+) -> Result<Bitmap> {
+    let mut reuse = Bitmap::new();
+    let pack_bytes = pack.pack_bytes.as_ref();
+    let hb = pack.idx.hash_bytes();
+    let pack_range = pack.bitmap_pos as usize..(pack.bitmap_pos + pack.bitmap_nr) as usize;
+    let send_positions: Vec<u32> = send_bits
+        .set_bits()
+        .filter(|pos| pack_range.contains(pos))
+        .map(|pos| pos as u32)
+        .collect();
+    loop {
+        let mut changed = false;
+        for &pos in &send_positions {
+            if reuse.get(pos as usize) {
+                continue;
+            }
+            let Ok(oid) = send_set.bitmap_index().oid_at(pos) else {
+                continue;
+            };
+            let Some(entry_off) = pack.idx.find_offset(&oid)? else {
+                continue;
+            };
+            if !entry_crc_ok(&pack.idx, &pack.pack_bytes, entry_off)? {
+                continue;
+            }
+            let mut p = entry_off as usize;
+            let (ty, _) = parse_pack_object_header(pack_bytes, &mut p)?;
+            match ty {
+                PackedType::Commit | PackedType::Tree | PackedType::Blob | PackedType::Tag => {
+                    reuse.set(pos as usize);
+                    changed = true;
+                }
+                PackedType::OfsDelta | PackedType::RefDelta => {
+                    // Streaming delta reuse is only enabled for thin packs; incremental
+                    // OFS fixups use on-disk zlib reuse during planning instead.
+                    if !opts.thin {
+                        continue;
+                    }
+                    let Some(base_oid) = delta_base_oid(&pack.idx, pack_bytes, entry_off, hb)?
+                    else {
+                        continue;
+                    };
+                    let Some(base_pos) = send_set.bitmap_index().position_of(&base_oid) else {
+                        continue;
+                    };
+                    if !reuse.get(base_pos as usize) {
+                        continue;
+                    }
+                    let Some(base_off) = pack.idx.find_offset(&base_oid)? else {
+                        continue;
+                    };
+                    let mut bp = base_off as usize;
+                    let Ok((base_ty, _)) = parse_pack_object_header(pack_bytes, &mut bp) else {
+                        continue;
+                    };
+                    if matches!(base_ty, PackedType::OfsDelta | PackedType::RefDelta) {
+                        continue;
+                    }
+                    reuse.set(pos as usize);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(reuse)
+}
+
+fn entry_crc_ok(
+    idx: &PackIndex,
+    pack_bytes: &crate::pack::PackData,
+    entry_off: u64,
+) -> Result<bool> {
+    crate::pack::packed_entry_matches_index_crc(idx, pack_bytes, entry_off)
+}
+
+fn delta_base_oid(
+    idx: &PackIndex,
+    pack_bytes: &[u8],
+    entry_off: u64,
+    _hb: usize,
+) -> Result<Option<ObjectId>> {
+    let hb = idx.oid_at(0).len();
+    let Some(dep) = read_packed_delta_dependency(pack_bytes, entry_off, hb)? else {
+        return Ok(None);
+    };
+    Ok(Some(match dep {
+        PackedDeltaDependency::RefBase { base_oid } => base_oid,
+        PackedDeltaDependency::OfsBase { base_offset } => {
+            let Some(row) = idx.find_position_by_offset_sorted(base_offset)? else {
+                return Ok(None);
+            };
+            ObjectId::from_bytes(idx.oid_at(row))?
+        }
+    }))
+}
+
+fn write_whole_reused(w: &mut dyn Write, entry: &[u8]) -> Result<u64> {
+    for chunk in entry.chunks(64 * 1024) {
+        w.write_all(chunk).map_err(Error::Io)?;
+    }
+    Ok(entry.len() as u64)
+}

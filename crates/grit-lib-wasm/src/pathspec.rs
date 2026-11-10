@@ -1,0 +1,3411 @@
+//! Git-compatible pathspec matching (magic tokens and global flags).
+//!
+//! ```rust
+//! use grit_lib::worktree::pathspec::parse_pathspecs_from_source;
+//!
+//! let specs = parse_pathspecs_from_source(b"README.md\n", false).expect("parse");
+//! assert_eq!(specs, ["README.md"]);
+//! ```
+//!
+//! Global pathspec flags (`GIT_*_PATHSPECS`) are supplied by embedders through
+//! [`PathspecOptions::globals`] or [`PathspecGlobalFlags::from_environment`]; the
+//! library does not read the process environment for them.
+
+use crate::git_path::CanonicalizeExt;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+use hashbrown::HashSet;
+
+use crate::attributes::MacroTable;
+use crate::crlf::path_gitattribute_values;
+use crate::crlf::AttrRule;
+use crate::environment::Environment;
+pub use crate::error::{AttrPathspecError, PathspecFromFileParseError, PathspecResolveError};
+use crate::precompose_config::argv_precompose_enabled;
+use crate::repo::Repository;
+use crate::unicode_normalization::precompose_utf8_path;
+use crate::wildmatch::{wildmatch, WM_CASEFOLD, WM_PATHNAME};
+
+/// Returns the length of the leading literal segment before the first glob metacharacter,
+/// matching Git's `simple_length()` (`*` `?` `[` `\`) on bytes.
+#[must_use]
+pub fn simple_length(match_str: &str) -> usize {
+    let b = match_str.as_bytes();
+    let mut len = 0usize;
+    for &c in b {
+        if matches!(c, b'*' | b'?' | b'[' | b'\\') {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+/// Whether the pattern uses wildcards after Git pathspec escaping rules.
+#[must_use]
+pub fn has_glob_chars(s: &str) -> bool {
+    simple_length(s) < s.len()
+}
+
+/// Read pathspec entries from raw file bytes (stdin or file), matching Git's
+/// `--pathspec-from-file` / `--pathspec-file-nul` rules.
+///
+/// * **NUL mode:** entries are separated by `NUL`; each segment is taken literally
+///   (no trimming or C-style unquoting).
+/// * **Line mode:** entries are separated by `LF`; optional `CR` before `LF`
+///   is stripped; optional trailing line without a final newline is included;
+///   double-quoted lines are C-unquoted (including octal escapes).
+pub fn parse_pathspecs_from_source(
+    data: &[u8],
+    nul_terminated: bool,
+) -> Result<Vec<String>, PathspecFromFileParseError> {
+    if nul_terminated {
+        let mut chunks: Vec<&[u8]> = data.split(|b| *b == 0).collect();
+        if chunks.last().copied() == Some(&[] as &[u8]) {
+            chunks.pop();
+        }
+        let mut out = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            if chunk.is_empty() {
+                out.push(String::new());
+                continue;
+            }
+            let entry = std::str::from_utf8(chunk)
+                .map_err(|_| PathspecFromFileParseError::InvalidUtf8InNulRecord)?;
+            out.push(entry.to_string());
+        }
+        return Ok(out);
+    }
+
+    let text = String::from_utf8_lossy(data);
+    let mut out = Vec::new();
+    for raw in text.split_inclusive('\n') {
+        let line = raw.trim_end_matches('\n').trim_end_matches('\r');
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        if line.starts_with('"') {
+            if line.ends_with('"') && line.len() >= 2 {
+                out.push(unquote_c_style_pathspec_line(line)?);
+            } else {
+                return Err(PathspecFromFileParseError::InvalidCStyleQuoting {
+                    line: line.to_string(),
+                });
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Unquote a single `--pathspec-from-file` line that is wrapped in double quotes.
+fn unquote_c_style_pathspec_line(s: &str) -> Result<String, PathspecFromFileParseError> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') || bytes.len() < 2 {
+        return Err(PathspecFromFileParseError::InvalidCStyleQuoting {
+            line: s.to_string(),
+        });
+    }
+
+    let inner = &bytes[1..bytes.len() - 1];
+    let mut out = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] != b'\\' {
+            out.push(inner[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= inner.len() {
+            return Err(PathspecFromFileParseError::InvalidEscapeAtEnd);
+        }
+        match inner[i] {
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'a' => out.push(7),
+            b'b' => out.push(8),
+            b'f' => out.push(12),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(11),
+            c if c.is_ascii_digit() => {
+                if i + 2 >= inner.len() {
+                    return Err(PathspecFromFileParseError::TruncatedOctalEscape);
+                }
+                let oct = std::str::from_utf8(&inner[i..i + 3])
+                    .map_err(|_| PathspecFromFileParseError::InvalidOctalBytes)?;
+                out.push(
+                    u8::from_str_radix(oct, 8)
+                        .map_err(|_| PathspecFromFileParseError::InvalidOctalValue)?,
+                );
+                i += 2;
+            }
+            other => {
+                return Err(PathspecFromFileParseError::InvalidEscapeSequence {
+                    escape: char::from(other),
+                });
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8(out).map_err(|_| PathspecFromFileParseError::InvalidUtf8InQuotedLine)
+}
+
+/// Raw bytes for [`ResolvedPathspecs::resolve`] from `--pathspec-from-file` (read by the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathspecFile {
+    /// File or stdin contents.
+    pub data: Vec<u8>,
+    /// When true, entries are NUL-separated (`--pathspec-file-nul`).
+    pub nul_terminated: bool,
+}
+
+impl PathspecFile {
+    /// Build input from bytes already read from a file or stdin.
+    #[must_use]
+    pub fn new(data: Vec<u8>, nul_terminated: bool) -> Self {
+        Self {
+            data,
+            nul_terminated,
+        }
+    }
+}
+
+/// Pathspec argv fragments resolved against a repository work tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ResolvedPathspecs {
+    /// Work-tree-relative pathspec strings for matching.
+    pub specs: Vec<String>,
+    /// User-facing spellings aligned with `specs` (argv or file lines).
+    pub sources: Vec<String>,
+    /// True when the caller supplied argv paths and/or a from-file (not "whole tree").
+    pub scoped: bool,
+}
+
+impl ResolvedPathspecs {
+    /// Resolve `raw` argv pathspecs and optional `--pathspec-from-file` bytes against `repo`.
+    ///
+    /// `cwd` is the process working directory used for relative pathspec prefixes (never read
+    /// from the environment inside the library).
+    ///
+    /// Embedders should prefer [`Repository::pathspec`](crate::repo::Repository::pathspec), which
+    /// returns a public [`Pathspec`] instead of this internal snapshot.
+    pub fn resolve(
+        repo: &Repository,
+        cwd: &Path,
+        raw: &[String],
+        from_file: Option<PathspecFile>,
+    ) -> Result<Self, PathspecResolveError> {
+        let work_tree = repo
+            .work_tree()
+            .ok_or(PathspecResolveError::NeedsWorkTree)?;
+        let prefix = pathdiff(cwd, work_tree);
+        let scoped = from_file.is_some() || !raw.is_empty();
+
+        let mut sources = Vec::new();
+        if let Some(input) = from_file {
+            let parsed = parse_pathspecs_from_source(&input.data, input.nul_terminated)?;
+            sources.extend(parsed);
+        }
+        for sel in raw {
+            sources.push(sel.clone());
+        }
+
+        if scoped && sources.is_empty() {
+            return Err(PathspecResolveError::EmptyPathspec);
+        }
+        for sel in &sources {
+            if sel.is_empty() {
+                return Err(PathspecResolveError::EmptyPathspec);
+            }
+        }
+
+        let argv_precompose = repo.pathspec_precompose_enabled();
+        let specs = sources
+            .iter()
+            .map(|sel| {
+                resolve_pathspec_in_worktree_with_argv_precompose(
+                    sel,
+                    sel,
+                    work_tree,
+                    prefix.as_deref(),
+                    argv_precompose,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            specs,
+            sources,
+            scoped,
+        })
+    }
+}
+
+/// Git global pathspec mode flags (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, …).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PathspecGlobalFlags {
+    /// `GIT_LITERAL_PATHSPECS` — treat `*` and `?` in argv pathspecs as literal.
+    pub literal_pathspecs: bool,
+    /// `GIT_GLOB_PATHSPECS` — treat argv pathspecs as globs.
+    pub glob_pathspecs: bool,
+    /// `GIT_NOGLOB_PATHSPECS` — disable glob interpretation in argv pathspecs.
+    pub noglob_pathspecs: bool,
+    /// `GIT_ICASE_PATHSPECS` — case-fold argv pathspec patterns.
+    pub icase_pathspecs: bool,
+}
+
+impl PathspecGlobalFlags {
+    /// Read Git's global pathspec flags from a captured [`Environment`].
+    #[must_use]
+    pub fn from_environment(env: &Environment) -> Self {
+        Self {
+            literal_pathspecs: env.git_literal_pathspecs,
+            glob_pathspecs: env.git_glob_pathspecs,
+            noglob_pathspecs: env.git_noglob_pathspecs,
+            icase_pathspecs: env.git_icase_pathspecs,
+        }
+    }
+
+    /// Validate flag combinations the same way Git does.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_global_pathspec_flags_from(self)
+    }
+}
+
+/// Options for building a [`Pathspec`] ([`Pathspec::parse`] or [`Repository::pathspec`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct PathspecOptions {
+    /// Work-tree-relative cwd prefix for argv pathspecs (`None` = repository root).
+    pub cwd_prefix: Option<String>,
+    /// Global pathspec mode flags (defaults match Git with no env vars set).
+    pub globals: PathspecGlobalFlags,
+    /// When set, overrides `core.ignorecase` for attribute pathspec patterns.
+    pub ignore_case: Option<bool>,
+    /// Optional `--pathspec-from-file` payload merged with argv items.
+    pub from_file: Option<PathspecFile>,
+}
+
+impl PathspecOptions {
+    /// Set [`Self::cwd_prefix`].
+    #[must_use]
+    pub fn with_cwd_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.cwd_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Set [`Self::globals`].
+    #[must_use]
+    pub fn with_globals(mut self, globals: PathspecGlobalFlags) -> Self {
+        self.globals = globals;
+        self
+    }
+
+    /// Set [`Self::from_file`].
+    #[must_use]
+    pub fn with_from_file(mut self, input: PathspecFile) -> Self {
+        self.from_file = Some(input);
+        self
+    }
+}
+
+/// Errors while assembling pathspec argv / from-file tokens (before work-tree resolution).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PathspecParseError {
+    /// No argv paths and no from-file entries.
+    #[error("empty pathspec")]
+    Empty,
+    /// A pathspec line or argv token was empty.
+    #[error("empty pathspec element")]
+    EmptyElement,
+    /// `--pathspec-from-file` bytes could not be parsed.
+    #[error(transparent)]
+    FromFile(#[from] PathspecFromFileParseError),
+    /// Incompatible global pathspec flags.
+    #[error("{0}")]
+    IncompatibleGlobals(String),
+}
+
+/// Parsed and optionally work-tree–resolved pathspec list for matching and display.
+#[derive(Debug, Clone)]
+pub struct Pathspec {
+    specs: Vec<String>,
+    sources: Vec<String>,
+    scoped: bool,
+    globals: PathspecGlobalFlags,
+    literal_prefix: Option<String>,
+}
+
+impl Pathspec {
+    /// Build a scoped pathspec from already-resolved work-tree-relative strings.
+    #[must_use]
+    pub fn scoped(
+        items: impl IntoIterator<Item = impl AsRef<str>>,
+        globals: PathspecGlobalFlags,
+    ) -> Self {
+        let specs: Vec<String> = items.into_iter().map(|s| s.as_ref().to_owned()).collect();
+        Self::from_resolved(
+            ResolvedPathspecs {
+                sources: specs.clone(),
+                specs,
+                scoped: true,
+            },
+            globals,
+        )
+    }
+
+    /// Pathspec list that selects the entire work tree (no argv paths).
+    #[must_use]
+    pub fn entire_tree(globals: PathspecGlobalFlags) -> Self {
+        Self {
+            specs: Vec::new(),
+            sources: Vec::new(),
+            scoped: false,
+            globals,
+            literal_prefix: None,
+        }
+    }
+
+    /// Parse argv / from-file pathspec tokens without resolving against a work tree.
+    ///
+    /// Work-tree-relative resolution and `core.precomposeunicode` normalization require
+    /// [`Repository::pathspec`].
+    pub fn parse(
+        items: impl IntoIterator<Item = impl AsRef<str>>,
+        options: &PathspecOptions,
+    ) -> Result<Self, PathspecParseError> {
+        options
+            .globals
+            .validate()
+            .map_err(PathspecParseError::IncompatibleGlobals)?;
+        let mut sources: Vec<String> = Vec::new();
+        if let Some(input) = &options.from_file {
+            let parsed = parse_pathspecs_from_source(&input.data, input.nul_terminated)
+                .map_err(PathspecParseError::FromFile)?;
+            sources.extend(parsed);
+        }
+        for item in items {
+            let s = item.as_ref();
+            if s.is_empty() {
+                return Err(PathspecParseError::EmptyElement);
+            }
+            sources.push(s.to_owned());
+        }
+        if sources.is_empty() {
+            return Err(PathspecParseError::Empty);
+        }
+        Ok(Self {
+            specs: sources.clone(),
+            literal_prefix: common_prefix_of_specs(&sources, options.globals),
+            scoped: true,
+            globals: options.globals,
+            sources,
+        })
+    }
+
+    /// Whether the invocation limits paths (false = entire work tree).
+    #[must_use]
+    pub fn is_entire_tree(&self) -> bool {
+        !self.scoped
+    }
+
+    /// Whether no path limit was given (alias of [`Self::is_entire_tree`]).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.is_entire_tree()
+    }
+
+    /// Longest shared literal directory prefix across positive specs (Git tree narrowing).
+    #[must_use]
+    pub fn common_prefix(&self) -> Option<&str> {
+        self.literal_prefix.as_deref()
+    }
+
+    /// Resolved work-tree-relative pathspec strings used for matching.
+    #[must_use]
+    pub fn specs(&self) -> &[String] {
+        &self.specs
+    }
+
+    /// User-facing spellings (argv or from-file lines) for messages and `--json`.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.sources.iter().map(String::as_str)
+    }
+
+    /// Global pathspec flags active for this list.
+    #[must_use]
+    pub fn globals(&self) -> PathspecGlobalFlags {
+        self.globals
+    }
+
+    /// Build from a resolved [`ResolvedPathspecs`] snapshot.
+    #[must_use]
+    pub(crate) fn from_resolved(resolved: ResolvedPathspecs, globals: PathspecGlobalFlags) -> Self {
+        let specs = resolved.specs.clone();
+        let literal_prefix = if resolved.scoped {
+            common_prefix_of_specs(&specs, globals)
+        } else {
+            None
+        };
+        Self {
+            scoped: resolved.scoped,
+            sources: resolved.sources,
+            specs,
+            literal_prefix,
+            globals,
+        }
+    }
+
+    fn match_context(&self, precompose: bool) -> PathspecMatchContext {
+        PathspecMatchContext {
+            precompose_paths: precompose,
+            globals: self.globals,
+            ..PathspecMatchContext::default()
+        }
+    }
+
+    /// Whether `path` is selected in `repo` (positive match, no exclude).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Repository::pathspec_matcher`].
+    pub fn matches(&self, repo: &Repository, path: &str) -> crate::error::Result<bool> {
+        if self.is_entire_tree() {
+            return Ok(true);
+        }
+        Ok(self.matcher(repo)?.matches(path))
+    }
+
+    /// Entry-aware matching (trailing `/`, submodules, `:(attr:...)`).
+    pub fn matches_entry(
+        &self,
+        repo: &Repository,
+        path: &str,
+        mode: u32,
+    ) -> crate::error::Result<bool> {
+        if self.is_entire_tree() {
+            return Ok(true);
+        }
+        Ok(self.matcher(repo)?.matches_entry(path, mode))
+    }
+
+    /// Whether a diff/staging change is selected (checks `old_path` for renames).
+    pub fn matches_change(
+        &self,
+        repo: &Repository,
+        path: &str,
+        old_path: Option<&str>,
+    ) -> crate::error::Result<bool> {
+        if self.is_entire_tree() {
+            return Ok(true);
+        }
+        Ok(self.matcher(repo)?.matches_change(path, old_path))
+    }
+
+    fn matcher(&self, repo: &Repository) -> crate::error::Result<PathspecMatcher<'_>> {
+        repo.pathspec_matcher_with_globals(&self.specs, self.globals)
+    }
+
+    /// Match using only pattern rules (no repository attributes); for tests and pure parsing.
+    #[must_use]
+    pub fn matches_path(&self, path: &str) -> bool {
+        if self.is_entire_tree() {
+            return true;
+        }
+        let ctx = self.match_context(false);
+        matches_pathspec_list_with_context(path, &self.specs, ctx)
+    }
+}
+
+fn common_prefix_of_specs(specs: &[String], globals: PathspecGlobalFlags) -> Option<String> {
+    let mut prefix: Option<String> = None;
+    for spec in specs {
+        if pathspec_is_exclude(spec) {
+            continue;
+        }
+        let (elem_magic, raw) = parse_element_magic(spec, globals);
+        let magic = combine_magic(elem_magic, globals);
+        if magic.exclude || magic.glob || magic.icase || !magic.attr_requirements.is_empty() {
+            return None;
+        }
+        let pattern = strip_top_magic(raw);
+        if has_glob_chars(pattern) {
+            return None;
+        }
+        let dir = pattern.strip_suffix('/').unwrap_or(pattern);
+        prefix = Some(match prefix {
+            None => dir.to_owned(),
+            Some(p) => shared_dir_prefix(&p, dir),
+        });
+        if prefix.as_deref() == Some("") {
+            return None;
+        }
+    }
+    prefix.filter(|p| !p.is_empty())
+}
+
+fn shared_dir_prefix(a: &str, b: &str) -> String {
+    let mut end = 0usize;
+    for (i, (ca, cb)) in a.bytes().zip(b.bytes()).enumerate() {
+        if ca != cb {
+            break;
+        }
+        if ca == b'/' {
+            end = i + 1;
+        }
+    }
+    if end == 0 {
+        String::new()
+    } else {
+        a[..end].trim_end_matches('/').to_owned()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PathspecMagic {
+    literal: bool,
+    glob: bool,
+    icase: bool,
+    exclude: bool,
+    /// `:(top)` / short `:/` — paths are relative to repo root.
+    top: bool,
+    prefix: Option<String>,
+    /// `:(attr:...)` requirements.
+    attr_requirements: Vec<AttrRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttrRequirement {
+    Set(String),
+    Unset(String),
+    Unspecified(String),
+    Value(String, String),
+}
+
+impl AttrRequirement {
+    fn name(&self) -> &str {
+        match self {
+            AttrRequirement::Set(name)
+            | AttrRequirement::Unset(name)
+            | AttrRequirement::Unspecified(name)
+            | AttrRequirement::Value(name, _) => name,
+        }
+    }
+}
+
+/// Whether `GIT_LITERAL_PATHSPECS` is enabled with default (unset) global flags.
+#[must_use]
+pub(crate) fn literal_pathspecs_enabled() -> bool {
+    PathspecGlobalFlags::default().literal_pathspecs
+}
+
+fn validate_global_pathspec_flags_from(globals: &PathspecGlobalFlags) -> Result<(), String> {
+    if globals.glob_pathspecs && globals.noglob_pathspecs {
+        return Err("global 'glob' and 'noglob' pathspec settings are incompatible".to_string());
+    }
+    if globals.literal_pathspecs
+        && (globals.glob_pathspecs || globals.noglob_pathspecs || globals.icase_pathspecs)
+    {
+        return Err(
+            "global 'literal' pathspec setting is incompatible with all other global pathspec settings"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Validates global pathspec flags the same way Git does (all flags unset / default).
+pub fn validate_global_pathspec_flags() -> Result<(), String> {
+    validate_global_pathspec_flags_from(&PathspecGlobalFlags::default())
+}
+
+fn is_valid_attr_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn split_attr_expr(expr: &str) -> Result<Vec<String>, AttrPathspecError> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_value = false;
+    let mut escaped = false;
+
+    for ch in expr.chars() {
+        if escaped {
+            if ch.is_ascii_whitespace() {
+                return Err(AttrPathspecError::DanglingEscape);
+            }
+            if ch != ',' {
+                return Err(AttrPathspecError::UnsupportedEscape);
+            }
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if in_value && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '=' {
+            in_value = true;
+            cur.push(ch);
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            if !cur.is_empty() {
+                parts.push(cur);
+                cur = String::new();
+            }
+            in_value = false;
+            continue;
+        }
+        cur.push(ch);
+    }
+
+    if escaped {
+        return Err(AttrPathspecError::DanglingEscape);
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    Ok(parts)
+}
+
+fn parse_attr_requirements(expr: &str) -> Result<Vec<AttrRequirement>, AttrPathspecError> {
+    let name_only = |name: &str| {
+        if name.contains('=') || !is_valid_attr_name(name) {
+            Err(AttrPathspecError::InvalidName(name.to_owned()))
+        } else {
+            Ok(name.to_owned())
+        }
+    };
+    let mut out = Vec::new();
+    for token in split_attr_expr(expr)? {
+        let req = if let Some(name) = token.strip_prefix('-') {
+            AttrRequirement::Unset(name_only(name)?)
+        } else if let Some(name) = token.strip_prefix('!') {
+            AttrRequirement::Unspecified(name_only(name)?)
+        } else if let Some((name, value)) = token.split_once('=') {
+            AttrRequirement::Value(name_only(name)?, value.to_owned())
+        } else {
+            AttrRequirement::Set(name_only(&token)?)
+        };
+        out.push(req);
+    }
+    if out.is_empty() {
+        return Err(AttrPathspecError::Empty);
+    }
+    Ok(out)
+}
+
+/// The `attr:` clauses inside a long-form `:(...)` magic prefix (none for other specs).
+fn attr_clauses(spec: &str) -> Vec<String> {
+    if PathspecGlobalFlags::default().literal_pathspecs {
+        return Vec::new();
+    }
+    let Some(rest) = spec.strip_prefix(":(") else {
+        return Vec::new();
+    };
+    let Some(close) = rest.find(')') else {
+        return Vec::new();
+    };
+    split_long_magic_tokens_raw(&rest[..close])
+        .into_iter()
+        .filter_map(|token| token.trim_start().strip_prefix("attr:").map(str::to_owned))
+        .collect()
+}
+
+/// Validate the `:(attr:...)` magic of every spec in `specs`.
+///
+/// Specs without attr magic are always accepted. A spec is rejected when it has more than one
+/// `attr:` clause or a clause that does not parse (empty clause, invalid attribute name, bad
+/// escape). A clause of only whitespace has no requirements and is accepted.
+///
+/// # Errors
+///
+/// [`crate::error::Error::InvalidAttrPathspec`] naming the first rejected spec and its
+/// [`AttrPathspecError`].
+pub fn validate_attr_pathspecs(specs: &[String]) -> crate::error::Result<()> {
+    for spec in specs {
+        let invalid = |reason| crate::error::Error::InvalidAttrPathspec {
+            spec: spec.clone(),
+            reason,
+        };
+        let clauses = attr_clauses(spec);
+        if clauses.len() > 1 {
+            return Err(invalid(AttrPathspecError::MultipleAttrClauses));
+        }
+        match clauses.first() {
+            Some(expr) if expr.is_empty() => return Err(invalid(AttrPathspecError::Empty)),
+            // Whitespace alone is an attr clause with no requirements, which Git accepts.
+            Some(expr) if expr.trim().is_empty() => {}
+            Some(expr) => {
+                parse_attr_requirements(expr).map_err(invalid)?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn split_long_magic_tokens(magic_part: &str) -> Vec<String> {
+    split_long_magic_tokens_raw(magic_part)
+        .into_iter()
+        .map(|token| token.trim().to_string())
+        .collect()
+}
+
+/// Split long magic on unescaped `,`, keeping surrounding whitespace.
+fn split_long_magic_tokens_raw(magic_part: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut escaped = false;
+    for ch in magic_part.chars() {
+        if escaped {
+            cur.push('\\');
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == ',' {
+            tokens.push(std::mem::take(&mut cur));
+            continue;
+        }
+        cur.push(ch);
+    }
+    if escaped {
+        cur.push('\\');
+    }
+    tokens.push(cur);
+    tokens
+}
+
+fn parse_long_magic(rest_after_paren: &str) -> Option<(PathspecMagic, &str)> {
+    let close = rest_after_paren.find(')')?;
+    let magic_part = &rest_after_paren[..close];
+    let tail = &rest_after_paren[close + 1..];
+    let mut magic = PathspecMagic::default();
+    for raw in split_long_magic_tokens(magic_part) {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(p) = token.strip_prefix("prefix:") {
+            magic.prefix = Some(p.to_string());
+            continue;
+        }
+        if let Some(expr) = token.strip_prefix("attr:") {
+            if let Ok(reqs) = parse_attr_requirements(expr) {
+                magic.attr_requirements = reqs;
+            }
+            continue;
+        }
+        if token.eq_ignore_ascii_case("literal") {
+            magic.literal = true;
+        } else if token.eq_ignore_ascii_case("glob") {
+            magic.glob = true;
+        } else if token.eq_ignore_ascii_case("icase") {
+            magic.icase = true;
+        } else if token.eq_ignore_ascii_case("exclude") {
+            magic.exclude = true;
+        } else if token.eq_ignore_ascii_case("top") {
+            magic.top = true;
+        }
+    }
+    Some((magic, tail))
+}
+
+/// `elem` is the full pathspec beginning with `:` (short magic form, not `:(...)`).
+fn parse_short_magic(elem: &str) -> (PathspecMagic, &str) {
+    let bytes = elem.as_bytes();
+    let mut i = 1usize;
+    let mut magic = PathspecMagic::default();
+    while i < bytes.len() && bytes[i] != b':' {
+        let ch = bytes[i];
+        if ch == b'^' {
+            magic.exclude = true;
+            i += 1;
+            continue;
+        }
+        let is_magic = match ch {
+            b'!' => {
+                magic.exclude = true;
+                true
+            }
+            b'/' => {
+                magic.top = true;
+                true
+            } // short `:/` = top
+            _ => false,
+        };
+        if is_magic {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if i < bytes.len() && bytes[i] == b':' {
+        i += 1;
+    }
+    (magic, &elem[i..])
+}
+
+/// Strip `:(magic)` / `:magic` prefix when not in literal-global mode.
+fn parse_element_magic(elem: &str, globals: PathspecGlobalFlags) -> (PathspecMagic, &str) {
+    if !elem.starts_with(':') || globals.literal_pathspecs {
+        return (PathspecMagic::default(), elem);
+    }
+    if let Some(rest) = elem.strip_prefix(":(") {
+        return parse_long_magic(rest).unwrap_or((PathspecMagic::default(), elem));
+    }
+    parse_short_magic(elem)
+}
+
+fn combine_magic(element: PathspecMagic, globals: PathspecGlobalFlags) -> PathspecMagic {
+    let mut m = element;
+    if globals.literal_pathspecs {
+        m.literal = true;
+    }
+    if globals.glob_pathspecs && !m.literal {
+        m.glob = true;
+    }
+    if globals.icase_pathspecs {
+        m.icase = true;
+    }
+    if globals.noglob_pathspecs && !m.glob {
+        m.literal = true;
+    }
+    m
+}
+
+fn strip_top_magic(mut pattern: &str) -> &str {
+    if let Some(r) = pattern.strip_prefix(":/") {
+        pattern = r;
+    }
+    pattern
+}
+
+/// Path prefix used for Bloom-filter lookups (`revision.c` `convert_pathspec_to_bloom_keyvec`).
+///
+/// `cwd_from_repo_root` is the path from the repository work tree to the process cwd, using `/`
+/// separators and no leading slash (empty string at repo root). Used for `:(top)` / `:/`.
+#[must_use]
+pub fn bloom_lookup_prefix_with_cwd(
+    spec: &str,
+    cwd_from_repo_root: Option<&str>,
+) -> Option<String> {
+    let (elem_magic, raw_pattern) = parse_element_magic(spec, PathspecGlobalFlags::default());
+    let magic = combine_magic(elem_magic, PathspecGlobalFlags::default());
+    if magic.exclude || magic.icase {
+        return None;
+    }
+    let pattern = strip_top_magic(raw_pattern);
+    if pattern.is_empty() {
+        return None;
+    }
+    let combined = if magic.top {
+        let cwd = cwd_from_repo_root.unwrap_or("").trim_end_matches('/');
+        if cwd.is_empty() {
+            pattern.to_string()
+        } else {
+            format!("{cwd}/{pattern}")
+        }
+    } else if let Some(prefix) = magic.prefix.as_deref() {
+        let base = prefix.trim_end_matches('/');
+        if base.is_empty() {
+            pattern.to_string()
+        } else {
+            normalize_relative_path_str(&format!("{base}/{pattern}"))
+        }
+    } else {
+        pattern.to_string()
+    };
+    let pattern = combined.as_str();
+    let mut len = simple_length(pattern);
+    if len != pattern.len() {
+        while len > 0 && pattern.as_bytes()[len - 1] != b'/' {
+            len -= 1;
+        }
+    }
+    while len > 0 && pattern.as_bytes()[len - 1] == b'/' {
+        len -= 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    Some(combined[..len].to_string())
+}
+
+/// Bloom filter lookup prefix for a pathspec at the repository root.
+#[must_use]
+pub fn bloom_lookup_prefix(spec: &str) -> Option<String> {
+    bloom_lookup_prefix_with_cwd(spec, None)
+}
+
+/// Whether every pathspec can participate in Bloom precomputation (Git `forbid_bloom_filters`).
+#[must_use]
+pub fn pathspecs_allow_bloom(specs: &[String]) -> bool {
+    specs.iter().all(|s| {
+        !s.is_empty() && !pathspec_is_exclude(s) && bloom_lookup_prefix_with_cwd(s, None).is_some()
+    })
+}
+
+/// Whether `path` is included when Git applies a pathspec list with optional `:(exclude)` entries.
+///
+/// A path is rejected if any exclude pathspec matches it. When at least one non-exclude pathspec is
+/// present, the path must also match one of those positives (`OR` semantics).
+#[must_use]
+pub fn path_allowed_by_pathspec_list(specs: &[String], path: &str) -> bool {
+    let mut has_positive = false;
+    let mut positive_match = false;
+    for s in specs {
+        let (elem, raw_pattern) = parse_element_magic(s, PathspecGlobalFlags::default());
+        let magic = combine_magic(elem, PathspecGlobalFlags::default());
+        if magic.exclude {
+            if path_matches_pathspec_tail(raw_pattern, path, magic) {
+                return false;
+            }
+            continue;
+        }
+        has_positive = true;
+        if pathspec_matches(s, path) {
+            positive_match = true;
+        }
+    }
+    !has_positive || positive_match
+}
+
+/// True when `spec` matches `path` for pathspec bookkeeping (positive match or exclude hit).
+#[must_use]
+pub fn pathspec_contributes_match(spec: &str, path: &str) -> bool {
+    pathspec_matches(spec, path) || pathspec_exclude_matches(spec, path)
+}
+
+/// Path under `prefix:` magic (e.g. `sub/`) for repository-relative `path`, including the
+/// directory entry `sub` when the prefix is `sub/`.
+fn path_for_match_under_magic_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let base = prefix.trim_end_matches('/');
+    if base.is_empty() {
+        return Some(path);
+    }
+    if path == base {
+        return Some("");
+    }
+    if let Some(rest) = path.strip_prefix(prefix) {
+        return Some(rest);
+    }
+    let anchored = if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    };
+    path.starts_with(&anchored).then(|| &path[anchored.len()..])
+}
+
+fn path_matches_pathspec_tail(raw_pattern: &str, path: &str, magic: PathspecMagic) -> bool {
+    if magic.literal && magic.glob {
+        return false;
+    }
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+    pathspec_matches_tail(pattern, path_for_match, magic)
+}
+
+/// True if `path` is matched by `spec` (Git pathspec syntax, including magic and globals).
+///
+/// Same as [`matches_pathspec`] (default file context; exclude specs never match positively here).
+/// See [`matches_pathspec_list`].
+#[must_use]
+pub(crate) fn pathspec_matches(spec: &str, path: &str) -> bool {
+    matches_pathspec(spec, path)
+}
+
+/// Returns whether `spec` uses Git's exclude magic (`:(exclude)`, `:!`, `:^`, etc.).
+#[must_use]
+pub fn pathspec_is_exclude(spec: &str) -> bool {
+    let (elem_magic, _) = parse_element_magic(spec, PathspecGlobalFlags::default());
+    combine_magic(elem_magic, PathspecGlobalFlags::default()).exclude
+}
+
+/// Whether a path-limited revision tree walk should recurse into directory `path`.
+///
+/// Uses [`pathspec_wants_descent_into_tree`] for non-exclude specs. Exclude-only lists never
+/// trigger that helper alone, but Git's implicit match-all still requires walking non-excluded
+/// directories so nested paths can match [`matches_pathspec_list`].
+#[must_use]
+pub(crate) fn pathspec_wants_descent_for_rev_tree(path: &str, specs: &[String]) -> bool {
+    if specs.is_empty() {
+        return true;
+    }
+    for spec in specs {
+        if !pathspec_is_exclude(spec) && pathspec_wants_descent_into_tree(spec, path) {
+            return true;
+        }
+    }
+    if !specs.iter().any(|s| pathspec_is_exclude(s)) {
+        return false;
+    }
+    let ctx = PathspecMatchContext {
+        is_directory: true,
+        is_git_submodule: false,
+        precompose_paths: false,
+        ..PathspecMatchContext::default()
+    };
+    for spec in specs {
+        if pathspec_is_exclude(spec)
+            && pathspec_exclude_element_matches_with_context(spec, path, ctx)
+        {
+            return false;
+        }
+    }
+    !specs.iter().any(|s| !pathspec_is_exclude(s))
+}
+
+/// Whether a path-limited tree walk must look at entry `path`: it matches `specs`, or it is a
+/// directory that [`pathspec_wants_descent_for_rev_tree`] says may hold a match.
+pub(crate) fn pathspec_entry_is_relevant(path: &str, is_tree: bool, specs: &[String]) -> bool {
+    matches_pathspec_list(path, specs)
+        || (is_tree && pathspec_wants_descent_for_rev_tree(path, specs))
+}
+
+/// Whether a path-limited tree walk should recurse into directory `full_name` for pathspec `spec`.
+///
+/// Used by revision history path limiting ([`crate::revwalk::rev_list`]) and diff tree pruning.
+/// Matches Git `tree-walk.c` `do_match` recursive
+/// directory interest: a directory is entered when a positive spec's leading literal segment
+/// matches it, or when the pattern begins with a glob metacharacter (`simple_length` zero).
+///
+/// Exclude-only patterns never trigger descent alone.
+#[must_use]
+pub fn pathspec_wants_descent_into_tree(spec: &str, full_name: &str) -> bool {
+    if pathspec_is_exclude(spec) {
+        return false;
+    }
+    let globals = PathspecGlobalFlags::default();
+    let (elem_magic, raw_pattern) = parse_element_magic(spec, globals);
+    let magic = combine_magic(elem_magic, globals);
+    if magic.exclude {
+        return false;
+    }
+    let pattern = strip_top_magic(raw_pattern);
+    let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+    if pattern.is_empty() || pattern == "." {
+        return true;
+    }
+    if let Some(prefix) = magic.prefix.as_deref() {
+        let base = prefix.trim_end_matches('/');
+        if !base.is_empty() && (full_name == base || base.starts_with(&format!("{full_name}/"))) {
+            return true;
+        }
+    }
+    let dir_prefix = format!("{full_name}/");
+    if pattern.starts_with(&dir_prefix) {
+        return true;
+    }
+    if ps_str_eq(pattern, full_name, magic.icase) {
+        return true;
+    }
+    pathspec_recursive_descent_wanted(pattern, magic, full_name)
+}
+
+fn pathspec_literal_descent_wanted(pattern: &str, dir: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix('/') {
+        return dir == prefix || path_is_under_dir(dir, prefix, false);
+    }
+    if dir == pattern {
+        return false;
+    }
+    dir.len() < pattern.len()
+        && path_starts_with(pattern, dir, false)
+        && pattern.as_bytes()[dir.len()] == b'/'
+}
+
+fn pathspec_recursive_descent_wanted(pattern: &str, magic: PathspecMagic, dir: &str) -> bool {
+    if magic.literal {
+        return pathspec_literal_descent_wanted(pattern, dir);
+    }
+    if simple_length(pattern) == 0 {
+        return true;
+    }
+
+    let icase = magic.icase;
+    let glob = magic.glob;
+    let components: Vec<&str> = dir.split('/').filter(|c| !c.is_empty()).collect();
+    pathspec_descent_match_components(pattern, icase, glob, &components)
+}
+
+fn pathspec_first_component(pat: &str) -> (&str, &str) {
+    match pat.find('/') {
+        Some(i) => (&pat[..i], &pat[i + 1..]),
+        None => (pat, ""),
+    }
+}
+
+fn pathspec_dir_name_matches_component(
+    pat_comp: &str,
+    dir_name: &str,
+    icase: bool,
+    glob: bool,
+) -> bool {
+    if pat_comp.is_empty() {
+        return true;
+    }
+    let nwl = simple_length(pat_comp);
+    if nwl == 0 {
+        return true;
+    }
+    if nwl >= pat_comp.len() {
+        return ps_str_eq(pat_comp, dir_name, icase);
+    }
+    let lit = &pat_comp[..nwl];
+    let lit_bytes = lit.as_bytes();
+    let dir_bytes = dir_name.as_bytes();
+    if icase {
+        if dir_bytes.len() < lit_bytes.len()
+            || !dir_bytes[..lit_bytes.len()].eq_ignore_ascii_case(lit_bytes)
+        {
+            return false;
+        }
+    } else if dir_bytes.len() < lit_bytes.len() || &dir_bytes[..lit_bytes.len()] != lit_bytes {
+        return false;
+    }
+    let flags = if icase { WM_CASEFOLD } else { 0 };
+    let wm_flags = if glob { flags | WM_PATHNAME } else { flags };
+    wildmatch(pat_comp.as_bytes(), dir_name.as_bytes(), wm_flags)
+}
+
+fn pathspec_descent_match_components(
+    pat: &str,
+    icase: bool,
+    glob: bool,
+    dir_components: &[&str],
+) -> bool {
+    if dir_components.is_empty() {
+        return simple_length(pat) == 0 || !pat.is_empty();
+    }
+    if simple_length(pat) == 0 {
+        return true;
+    }
+    let (pat_comp, pat_rest) = pathspec_first_component(pat);
+    if !pathspec_dir_name_matches_component(pat_comp, dir_components[0], icase, glob) {
+        return false;
+    }
+    pathspec_descent_match_components(pat_rest, icase, glob, &dir_components[1..])
+}
+
+#[cfg(test)]
+mod pathspec_descent_tests {
+    use super::*;
+
+    #[test]
+    fn descent_wildcard_non_final_component() {
+        assert!(pathspec_wants_descent_into_tree("*/g.c", "a"));
+        assert!(pathspec_wants_descent_into_tree("a/*/f.c", "a"));
+        assert!(pathspec_wants_descent_into_tree("a/*/f.c", "a/b"));
+        assert!(pathspec_wants_descent_into_tree(":(glob)**/f.c", "a"));
+        assert!(pathspec_wants_descent_into_tree(":(glob)*/g.c", "a"));
+        assert!(pathspec_wants_descent_into_tree(":(icase)A/g.c", "a"));
+        assert!(!pathspec_wants_descent_into_tree(":(literal)*g.c", "a"));
+        assert!(!pathspec_wants_descent_into_tree("a/*.c", "b"));
+        assert!(pathspec_wants_descent_into_tree("b*/log.c", "builtin"));
+        assert!(!pathspec_wants_descent_into_tree("b*/log.c", "other"));
+        assert!(pathspec_wants_descent_into_tree("bu?ltin/log.c", "builtin"));
+        assert!(pathspec_wants_descent_into_tree(
+            ":(icase)B*/LOG.C",
+            "builtin"
+        ));
+        assert!(!pathspec_wants_descent_into_tree(":(icase)b*/log.c", "é"));
+    }
+
+    #[test]
+    fn glob_doublestar_path_matches_nested_file() {
+        let specs = vec![":(glob)**/f.c".to_owned()];
+        assert!(matches_pathspec_list("a/b/f.c", &specs));
+    }
+}
+
+/// True if `spec` uses `:(top)` or short `:/` (repo-root-relative) magic.
+#[must_use]
+pub fn pathspec_has_top(spec: &str) -> bool {
+    let (elem_magic, _) = parse_element_magic(spec, PathspecGlobalFlags::default());
+    combine_magic(elem_magic, PathspecGlobalFlags::default()).top
+}
+
+/// True if `spec` carries an `attr:` clause in long-form `:(...)` magic, so matching it needs
+/// `.gitattributes` rules. Malformed clauses count too; [`validate_attr_pathspecs`] rejects them.
+///
+/// Such specs only match through the attribute-aware entry points:
+/// [`crate::repo::Repository::pathspec_matcher`], which loads the repository's attributes and
+/// validates the clauses, or [`matches_pathspec_list_for_object`] with caller-supplied rules.
+#[must_use]
+pub(crate) fn pathspec_has_attr_magic(spec: &str) -> bool {
+    // Attr magic only exists in long form; skip the allocating parse for every other spec.
+    spec.starts_with(":(") && spec.contains("attr:") && !attr_clauses(spec).is_empty()
+}
+
+/// A resolved pathspec list bound to one repository's matching rules, built by
+/// [`crate::repo::Repository::pathspec_matcher`].
+///
+/// Holds the repository's attributes when a spec carries `:(attr:...)` magic, so testing many
+/// paths reads them once. Attr requirements see `[attr]` macro expansion and match attribute
+/// patterns case-insensitively when `core.ignorecase` is set, as Git does. Paths are treated as regular files: a spec ending in `/` does not match
+/// a path equal to its directory, and `builtin_objectmode` reads as `100644`. Use
+/// `matches_pathspec_list_for_object` when the entry mode matters.
+#[derive(Debug, Clone)]
+pub(crate) struct PathspecMatcher<'s> {
+    specs: Cow<'s, [String]>,
+    precompose: bool,
+    attrs: Option<std::sync::Arc<crate::attributes::ParsedGitAttributes>>,
+    /// Match attribute patterns case-insensitively (`core.ignorecase`).
+    attr_icase: bool,
+    globals: PathspecGlobalFlags,
+}
+
+impl<'s> PathspecMatcher<'s> {
+    /// Build a matcher from pathspec strings and optional parsed gitattributes.
+    pub(crate) fn new(
+        specs: &'s [String],
+        precompose: bool,
+        attrs: Option<std::sync::Arc<crate::attributes::ParsedGitAttributes>>,
+        attr_icase: bool,
+        globals: PathspecGlobalFlags,
+    ) -> Self {
+        // The attribute-aware matcher has no precompose context, so normalize the specs up front.
+        let specs = if precompose && attrs.is_some() {
+            Cow::Owned(
+                specs
+                    .iter()
+                    .map(|spec| precompose_utf8_path(spec).into_owned())
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(specs)
+        };
+        Self {
+            specs,
+            precompose,
+            attrs,
+            attr_icase,
+            globals,
+        }
+    }
+
+    /// Whether `path` is selected: it matches at least one positive spec (any path when there
+    /// are none or the list is empty) and no `:(exclude)` spec.
+    #[must_use]
+    pub fn matches(&self, path: &str) -> bool {
+        const REGULAR_FILE: u32 = 0o100644;
+        self.matches_entry(path, REGULAR_FILE)
+    }
+
+    /// Like [`Self::matches`], but uses Git tree/index entry `mode` for trailing-slash and
+    /// submodule pathspec semantics.
+    ///
+    /// Required for path-limited history walks and staging when specs include `:(attr:...)` magic.
+    #[must_use]
+    pub fn matches_entry(&self, path: &str, mode: u32) -> bool {
+        let ctx = context_from_mode_bits(mode);
+        let match_ctx = PathspecMatchContext {
+            is_directory: ctx.is_directory,
+            is_git_submodule: ctx.is_git_submodule,
+            precompose_paths: self.precompose,
+            globals: self.globals,
+        };
+        let Some(attrs) = &self.attrs else {
+            return matches_pathspec_list_with_context(path, &self.specs, match_ctx);
+        };
+        let path = if self.precompose {
+            precompose_utf8_path(path)
+        } else {
+            Cow::Borrowed(path)
+        };
+        let lookup = AttrLookup::new(&attrs.rules, &attrs.macros, self.attr_icase);
+        matches_pathspec_list_with_attrs(&path, mode, lookup, &self.specs)
+    }
+
+    /// Whether a changed file is selected, checking its current `path` and, for a rename or
+    /// copy, its `old_path` too (Git limits diffs on either side of a rename).
+    #[must_use]
+    pub fn matches_change(&self, path: &str, old_path: Option<&str>) -> bool {
+        self.specs.is_empty()
+            || self.matches(path)
+            || old_path.is_some_and(|old| old != path && self.matches(old))
+    }
+}
+
+fn pathspec_match_one_positive(path: &str, magic: PathspecMagic, raw_pattern: &str) -> bool {
+    if magic.literal && magic.glob {
+        return false;
+    }
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+    pathspec_matches_tail(pattern, path_for_match, magic)
+}
+
+/// Attribute state that `:(attr:...)` requirements are evaluated against.
+#[derive(Clone, Copy)]
+pub(crate) struct AttrLookup<'a> {
+    rules: &'a [AttrRule],
+    /// `[attr]` macro definitions; `None` means no macros are defined.
+    macros: Option<&'a MacroTable>,
+    /// Match attribute patterns case-insensitively (`core.ignorecase`).
+    icase: bool,
+}
+
+impl<'a> AttrLookup<'a> {
+    pub fn new(rules: &'a [AttrRule], macros: &'a MacroTable, icase: bool) -> Self {
+        Self {
+            rules,
+            macros: Some(macros),
+            icase,
+        }
+    }
+
+    fn rules_only(rules: &'a [AttrRule]) -> Self {
+        Self {
+            rules,
+            macros: None,
+            icase: false,
+        }
+    }
+}
+
+fn attr_requirements_match(
+    requirements: &[AttrRequirement],
+    attrs: AttrLookup<'_>,
+    path: &str,
+    is_dir: bool,
+    mode: u32,
+) -> bool {
+    let no_macros = MacroTable::default();
+    let assigned = path_gitattribute_values(
+        attrs.rules,
+        attrs.macros.unwrap_or(&no_macros),
+        attrs.icase,
+        path,
+        is_dir,
+    );
+    requirements.iter().all(|req| {
+        let value: Option<Cow<'_, str>> = if req.name() == "builtin_objectmode" {
+            (mode != 0).then(|| Cow::Owned(format!("{mode:06o}")))
+        } else {
+            assigned
+                .get(req.name())
+                .map(|v| Cow::Borrowed(v.display()))
+                .filter(|v| v != "unspecified")
+        };
+        match req {
+            AttrRequirement::Set(_) => value.as_deref() == Some("set"),
+            AttrRequirement::Unset(_) => value.as_deref() == Some("unset"),
+            AttrRequirement::Unspecified(_) => value.is_none(),
+            AttrRequirement::Value(_, expected) => value.as_deref() == Some(expected.as_str()),
+        }
+    })
+}
+
+pub(crate) fn matches_pathspec_element_with_context(
+    spec: &str,
+    path: &str,
+    ctx: PathspecMatchContext,
+) -> bool {
+    let (elem_magic, raw_pattern) = parse_element_magic(spec, ctx.globals);
+    let magic = combine_magic(elem_magic, ctx.globals);
+    if magic.exclude {
+        return false;
+    }
+    if magic.literal && magic.glob {
+        return false;
+    }
+    if !magic.attr_requirements.is_empty() {
+        return false;
+    }
+    if magic.literal || magic.glob || magic.icase {
+        return pathspec_match_one_positive(path, magic, raw_pattern);
+    }
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+    matches_pathspec_with_context(pattern, path_for_match, ctx)
+}
+
+pub(crate) fn pathspec_exclude_element_matches_with_context(
+    spec: &str,
+    path: &str,
+    ctx: PathspecMatchContext,
+) -> bool {
+    let (elem_magic, raw_pattern) = parse_element_magic(spec, ctx.globals);
+    let mut magic = combine_magic(elem_magic, ctx.globals);
+    if !magic.exclude {
+        return false;
+    }
+    magic.exclude = false;
+    if magic.literal && magic.glob {
+        return false;
+    }
+    if !magic.attr_requirements.is_empty() {
+        // Attribute pathspecs need `.gitattributes` context; use
+        // [`matches_pathspec_list_for_object`] for those.
+        return false;
+    }
+    if magic.literal || magic.glob || magic.icase {
+        return pathspec_match_one_positive(path, magic, raw_pattern);
+    }
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+    matches_pathspec_with_context(pattern, path_for_match, ctx)
+}
+
+/// True if `path` is matched by an exclude pathspec's pattern. Returns `false` if `spec` is not
+/// an exclude pathspec.
+#[must_use]
+pub fn pathspec_exclude_matches(spec: &str, path: &str) -> bool {
+    pathspec_exclude_element_matches_with_context(spec, path, PathspecMatchContext::default())
+}
+
+/// When every pathspec is an exclude and none use `:(top)` / `:/`, Git prepends an implicit
+/// positive that matches only under the process cwd (relative to the work tree), not the whole
+/// repository (`PATHSPEC_PREFER_CWD` in `pathspec.c`). `cwd_from_repo_root` is that prefix
+/// without a trailing slash, or empty at the work tree root.
+#[must_use]
+pub(crate) fn extend_pathspec_list_implicit_cwd(
+    specs: &[String],
+    cwd_from_repo_root: Option<&str>,
+) -> Vec<String> {
+    if specs.is_empty() {
+        return specs.to_vec();
+    }
+    if !specs.iter().all(|s| pathspec_is_exclude(s)) {
+        return specs.to_vec();
+    }
+    let any_top = specs.iter().any(|s| pathspec_has_top(s));
+    if any_top {
+        return specs.to_vec();
+    }
+    let Some(cwd) = cwd_from_repo_root.map(str::trim).filter(|s| !s.is_empty()) else {
+        return specs.to_vec();
+    };
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        return specs.to_vec();
+    }
+    let mut out = Vec::with_capacity(specs.len() + 1);
+    // Git `parse_pathspec` with `PATHSPEC_PREFER_CWD` adds `.` (see pathspec.c), not `{cwd}/`.
+    out.push(".".to_owned());
+    out.extend_from_slice(specs);
+    out
+}
+
+/// Git `match_pathspec` semantics over a pathspec list: OR of positive specs minus OR of exclude
+/// specs. If every element is exclude-only, Git implicitly prepends `.` (match all); this
+/// function does the same.
+///
+/// No `.gitattributes` rules are available here, so a positive `:(attr:...)` spec never matches
+/// and an exclude `:(exclude,attr:...)` spec never excludes. Use
+/// [`crate::repo::Repository::paths_match_pathspecs`] or [`matches_pathspec_list_for_object`]
+/// when specs may carry attr magic (see `pathspec_has_attr_magic`).
+#[must_use]
+pub(crate) fn matches_pathspec_list(path: &str, specs: &[String]) -> bool {
+    matches_pathspec_list_with_context(path, specs, PathspecMatchContext::default())
+}
+
+/// Like [`matches_pathspec_list`], but uses `ctx` for non-magic pathspec elements (trailing `/`).
+///
+/// Like [`matches_pathspec_list`], this does not evaluate `:(attr:...)` magic: positive attr specs
+/// never match and attr excludes never exclude.
+#[must_use]
+pub(crate) fn matches_pathspec_list_with_context(
+    path: &str,
+    specs: &[String],
+    ctx: PathspecMatchContext,
+) -> bool {
+    if specs.is_empty() {
+        return true;
+    }
+    let mut has_exclude = false;
+    let mut has_positive = false;
+    let mut positive = false;
+    for spec in specs {
+        if pathspec_is_exclude(spec) {
+            has_exclude = true;
+        } else {
+            has_positive = true;
+            positive = positive || matches_pathspec_element_with_context(spec, path, ctx);
+        }
+    }
+    if has_positive && !positive {
+        return false;
+    }
+    if !has_exclude {
+        return true;
+    }
+    let excluded = specs.iter().any(|s| {
+        pathspec_is_exclude(s) && pathspec_exclude_element_matches_with_context(s, path, ctx)
+    });
+    !excluded
+}
+
+/// Whether any of `sorted_paths` matches the single pathspec `spec`.
+///
+/// Same result as testing every path with [`matches_pathspec_list_with_context`] and `[spec]`,
+/// but a plain literal pathspec (no magic, no wildcards, no `./`) is answered with a binary
+/// search instead of a scan, so checking many pathspecs against a large index stays cheap.
+///
+/// `sorted_paths` must be sorted in byte order (the [`str`] ordering) for the result to be
+/// correct; duplicates are allowed.
+pub(crate) fn sorted_paths_match_pathspec<S: AsRef<str>>(
+    spec: &str,
+    sorted_paths: &[S],
+    ctx: PathspecMatchContext,
+) -> bool {
+    let list = [spec.to_owned()];
+    let matches_linearly = |p: &S| matches_pathspec_list_with_context(p.as_ref(), &list, ctx);
+    if !is_plain_literal_pathspec(spec, ctx) {
+        return sorted_paths.iter().any(matches_linearly);
+    }
+    let spec_nfc = literal_spec_for_lookup(spec, ctx);
+    if sorted_literal_lookup(&spec_nfc, sorted_paths) {
+        return true;
+    }
+    // A hit on the NFC spelling is always a match; a path stored in another normalization form
+    // can only match through a non-ASCII segment, so a miss rechecks just those paths.
+    ctx.precompose_paths
+        && sorted_paths
+            .iter()
+            .filter(|p| !p.as_ref().is_ascii())
+            .any(matches_linearly)
+}
+
+/// Binary-search `sorted_paths` for the plain literal `spec` (exact path or directory prefix).
+fn sorted_literal_lookup<S: AsRef<str>>(spec: &str, sorted_paths: &[S]) -> bool {
+    let has_path_with_prefix = |prefix: &str| {
+        let at = sorted_paths.partition_point(|p| p.as_ref() < prefix);
+        sorted_paths
+            .get(at)
+            .is_some_and(|p| p.as_ref().starts_with(prefix))
+    };
+    if spec.ends_with('/') {
+        return has_path_with_prefix(spec);
+    }
+    let at = sorted_paths.partition_point(|p| p.as_ref() < spec);
+    if sorted_paths.get(at).is_some_and(|p| p.as_ref() == spec) {
+        return true;
+    }
+    has_path_with_prefix(&format!("{spec}/"))
+}
+
+/// The spelling of a plain literal `spec` that [`matches_pathspec_with_context`] compares paths
+/// against: NFC when the context precomposes paths, else `spec` itself.
+pub(crate) fn literal_spec_for_lookup(spec: &str, ctx: PathspecMatchContext) -> Cow<'_, str> {
+    if ctx.precompose_paths {
+        precompose_utf8_path(spec)
+    } else {
+        Cow::Borrowed(spec)
+    }
+}
+
+/// Repository-relative paths when every spec is a plain literal file path (no trailing `/`).
+///
+/// Used to narrow index/worktree diffs to a small path set without scanning the full index.
+/// Returns `None` when `ctx` precomposes paths: another normalization form of a spec could also
+/// match, and only a scan of the candidate paths can find it.
+pub(crate) fn exact_literal_pathspec_set(
+    specs: &[String],
+    ctx: PathspecMatchContext,
+) -> Option<std::collections::BTreeSet<String>> {
+    if specs.is_empty() || ctx.precompose_paths {
+        return None;
+    }
+    if !specs
+        .iter()
+        .all(|s| is_plain_literal_pathspec(s, ctx) && !s.ends_with('/'))
+    {
+        return None;
+    }
+    Some(specs.iter().cloned().collect())
+}
+
+/// Whether `spec` matches exactly the path `spec` and everything under directory `spec`
+/// (no magic, no wildcards, no `./`, and no context that changes trailing-`/` handling).
+///
+/// With [`PathspecMatchContext::precompose_paths`], "the path `spec`" means equality after NFC
+/// normalization of both sides; see [`literal_spec_for_lookup`].
+pub(crate) fn is_plain_literal_pathspec(spec: &str, ctx: PathspecMatchContext) -> bool {
+    !ctx.is_directory
+        && !ctx.is_git_submodule
+        && !spec.is_empty()
+        && spec != "."
+        && !spec.starts_with("./")
+        && !spec.starts_with(':')
+        && simple_length(spec) == spec.len()
+        && !ctx.globals.literal_pathspecs
+        && !ctx.globals.glob_pathspecs
+        && !ctx.globals.noglob_pathspecs
+        && !ctx.globals.icase_pathspecs
+}
+
+/// Encode an exact repository-relative path for pathspec-limited diffs and Bloom prechecks.
+///
+/// Tree diffs and skip-applied filters collect literal object paths. Names may begin with `:`
+/// or contain glob metacharacters, so they must not be passed as raw user pathspec syntax.
+pub(crate) fn repository_path_as_literal_pathspec(path: &str) -> String {
+    let ctx = PathspecMatchContext::default();
+    if is_plain_literal_pathspec(path, ctx) {
+        path.to_owned()
+    } else {
+        format!(":(literal){path}")
+    }
+}
+
+/// A pathspec list prepared once for matching many paths with the same context.
+///
+/// Gives the same answers as [`matches_pathspec_list_with_context`] with the list and context
+/// it was built from. When every element is a plain literal (see
+/// [`sorted_paths_match_pathspec`]), a path is answered with hash lookups of the path and its
+/// leading directories instead of comparing it against every element, which keeps matching a
+/// large index against many pathspecs linear in the index size.
+pub(crate) struct PathspecListMatcher<'a> {
+    specs: &'a [String],
+    ctx: PathspecMatchContext,
+    literals: Option<LiteralPathspecSet>,
+}
+
+/// Plain literal pathspecs split by how they match, spelled as [`literal_spec_for_lookup`] does.
+struct LiteralPathspecSet {
+    /// Specs without a trailing `/`: they match the path itself.
+    exact: HashSet<String>,
+    /// Directories whose contents match: every spec, with one trailing `/` removed.
+    dirs: HashSet<String>,
+}
+
+impl<'a> PathspecListMatcher<'a> {
+    /// Prepare `specs` for repeated matching under `ctx`.
+    pub fn new(specs: &'a [String], ctx: PathspecMatchContext) -> Self {
+        let all_plain =
+            !specs.is_empty() && specs.iter().all(|s| is_plain_literal_pathspec(s, ctx));
+        let literals = all_plain.then(|| {
+            let mut set = LiteralPathspecSet {
+                exact: HashSet::with_capacity(specs.len()),
+                dirs: HashSet::with_capacity(specs.len()),
+            };
+            for spec in specs {
+                let spec = literal_spec_for_lookup(spec, ctx);
+                match spec.strip_suffix('/') {
+                    Some(dir) => {
+                        set.dirs.insert(dir.to_owned());
+                    }
+                    None => {
+                        set.exact.insert(spec.to_string());
+                        set.dirs.insert(spec.into_owned());
+                    }
+                }
+            }
+            set
+        });
+        Self {
+            specs,
+            ctx,
+            literals,
+        }
+    }
+
+    /// Whether `path` matches the pathspec list.
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        let Some(set) = &self.literals else {
+            return matches_pathspec_list_with_context(path, self.specs, self.ctx);
+        };
+        let path = literal_spec_for_lookup(path, self.ctx);
+        let path = path.as_ref();
+        if set.exact.contains(path) {
+            return true;
+        }
+        path.bytes()
+            .enumerate()
+            .any(|(i, b)| b == b'/' && set.dirs.contains(&path[..i]))
+    }
+}
+
+/// `matches_pathspec_list` for tree/index objects with mode and `.gitattributes` rules.
+///
+/// `attr_rules` are applied without `[attr]` macro definitions and with case-sensitive
+/// patterns; [`crate::repo::Repository::pathspec_matcher`] also honors macros and
+/// `core.ignorecase`.
+#[must_use]
+pub(crate) fn matches_pathspec_list_for_object(
+    path: &str,
+    mode: u32,
+    attr_rules: &[AttrRule],
+    specs: &[String],
+) -> bool {
+    matches_pathspec_list_with_attrs(path, mode, AttrLookup::rules_only(attr_rules), specs)
+}
+
+pub(crate) fn matches_pathspec_list_with_attrs(
+    path: &str,
+    mode: u32,
+    attrs: AttrLookup<'_>,
+    specs: &[String],
+) -> bool {
+    if specs.is_empty() {
+        return true;
+    }
+    let mut has_exclude = false;
+    let mut has_positive = false;
+    let mut positive = false;
+    for spec in specs {
+        if pathspec_is_exclude(spec) {
+            has_exclude = true;
+        } else {
+            has_positive = true;
+            positive = positive || matches_pathspec_for_object_with_attrs(spec, path, mode, attrs);
+        }
+    }
+    if has_positive && !positive {
+        return false;
+    }
+    if !has_exclude {
+        return true;
+    }
+    !specs.iter().any(|s| {
+        pathspec_is_exclude(s) && matches_pathspec_exclude_for_object(s, path, mode, attrs)
+    })
+}
+
+fn matches_pathspec_exclude_for_object(
+    spec: &str,
+    path: &str,
+    mode: u32,
+    attrs: AttrLookup<'_>,
+) -> bool {
+    let globals = PathspecGlobalFlags::default();
+    let (elem_magic, raw_pattern) = parse_element_magic(spec, globals);
+    let mut magic = combine_magic(elem_magic, globals);
+    if !magic.exclude {
+        return false;
+    }
+    magic.exclude = false;
+    if magic.literal && magic.glob {
+        return false;
+    }
+    let ctx = context_from_mode_bits(mode);
+    let is_dir_for_attr = path.ends_with('/') || ctx.is_directory || ctx.is_git_submodule;
+    if !magic.attr_requirements.is_empty()
+        && !attr_requirements_match(&magic.attr_requirements, attrs, path, is_dir_for_attr, mode)
+    {
+        return false;
+    }
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+    if magic.literal || magic.glob || magic.icase {
+        pathspec_matches_tail(pattern, path_for_match, magic)
+    } else {
+        matches_pathspec_with_context(pattern, path_for_match, ctx)
+    }
+}
+
+fn pathspec_matches_tail(pattern: &str, path: &str, magic: PathspecMagic) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+
+    let flags = if magic.icase { WM_CASEFOLD } else { 0 };
+
+    if magic.literal {
+        return literal_prefix_match(pattern, path);
+    }
+
+    let wm_flags = if magic.glob {
+        flags | WM_PATHNAME
+    } else {
+        flags
+    };
+
+    let pattern_bytes = pattern.as_bytes();
+    let path_bytes = path.as_bytes();
+    let simple = simple_length(pattern);
+
+    // Git `match_pathspec_item`: exact / directory prefix before `git_fnmatch`.
+    // Only when the pattern has no glob metacharacters (`simple_length` spans the whole pattern);
+    // otherwise a pattern like `a[a]` must not match children via `a[a]/` prefix (t6130 vs ls-tree).
+    if ps_str_eq(pattern, path, magic.icase) {
+        return true;
+    }
+    if simple == pattern.len() {
+        if let Some(prefix) = pattern.strip_suffix('/') {
+            if ps_str_eq(prefix, path, magic.icase) {
+                return true;
+            }
+            if path_is_under_dir(path, prefix, magic.icase) {
+                return true;
+            }
+        } else if path_is_under_dir(path, pattern, magic.icase) {
+            return true;
+        }
+    }
+
+    // `:(glob)**/*.txt` at repo root: Git matches `untracked.txt` (leading `**/` is optional).
+    if magic.glob && !path.contains('/') && pattern.starts_with("**/") {
+        if wildmatch(pattern_bytes, path_bytes, wm_flags) {
+            return true;
+        }
+        if let Some(suffix) = pattern.strip_prefix("**/") {
+            if wildmatch(suffix.as_bytes(), path_bytes, wm_flags) {
+                return true;
+            }
+        }
+    }
+
+    // Wildcard: require literal bytes up to `simple_length`, then wildmatch the tail only.
+    if simple < pattern.len() {
+        if path_bytes.len() < simple {
+            return false;
+        }
+        let path_lit = &path_bytes[..simple];
+        let pat_lit = &pattern_bytes[..simple];
+        let same = if magic.icase {
+            path_lit.eq_ignore_ascii_case(pat_lit)
+        } else {
+            path_lit == pat_lit
+        };
+        if !same {
+            return false;
+        }
+        let pat_rest = &pattern[simple..];
+        let path_rest = &path[simple..];
+        return wildmatch(pat_rest.as_bytes(), path_rest.as_bytes(), wm_flags);
+    }
+
+    ps_str_eq(pattern, path, magic.icase) || path_is_under_dir(path, pattern, magic.icase)
+}
+
+fn ps_str_eq(a: &str, b: &str, icase: bool) -> bool {
+    if icase {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+fn path_starts_with(path: &str, prefix: &str, icase: bool) -> bool {
+    if icase {
+        path.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    } else {
+        path.starts_with(prefix)
+    }
+}
+
+/// Whether `path` starts with `dir` followed by `/` (the path lies inside directory `dir`).
+fn path_is_under_dir(path: &str, dir: &str, icase: bool) -> bool {
+    path.as_bytes().get(dir.len()) == Some(&b'/') && path_starts_with(path, dir, icase)
+}
+
+fn literal_prefix_match(pattern: &str, path: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('/') {
+        return path == prefix || path_is_under_dir(path, prefix, false);
+    }
+    path == pattern || path_is_under_dir(path, pattern, false)
+}
+
+/// Literal pathspec match for `ls-tree` when the pattern has no `*`/`?` (brackets stay literal).
+#[cfg(test)]
+fn ls_tree_literal_match(pattern: &str, path: &str, ctx: PathspecMatchContext) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('/') {
+        if path_is_under_dir(path, prefix, false) {
+            return true;
+        }
+        if path == prefix {
+            return ctx.is_directory || ctx.is_git_submodule;
+        }
+        return false;
+    }
+    path == pattern || path_is_under_dir(path, pattern, false)
+}
+
+/// Optional path metadata for literal pathspecs with a trailing `/` (tree-walk / diff-tree).
+///
+/// Git treats `dir/` as “directory or git submodule only”: a regular file `dir`
+/// does not match, but a tree entry `dir` or gitlink `dir` does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PathspecMatchContext {
+    /// The index/tree entry is a directory (mode `040000`).
+    pub is_directory: bool,
+    /// The entry is a git submodule / gitlink (`160000`).
+    pub is_git_submodule: bool,
+    /// NFC-normalize pathspec and path when matching (per-repository `core.precomposeunicode`).
+    pub precompose_paths: bool,
+    /// Git global pathspec mode flags for this match.
+    pub globals: PathspecGlobalFlags,
+}
+
+/// Returns whether `path` matches the pathspec `spec` with default (file) context.
+///
+/// For pathspecs ending in `/`, a path equal to the prefix matches only when
+/// [`PathspecMatchContext`] indicates a directory or submodule; see
+/// [`matches_pathspec_with_context`].
+///
+/// `:(attr:...)` requirements are not evaluated here (only the pattern part is matched); use
+/// `matches_pathspec_for_object` or [`crate::repo::Repository::paths_match_pathspecs`] for
+/// specs where `pathspec_has_attr_magic` is true.
+#[must_use]
+pub(crate) fn matches_pathspec(spec: &str, path: &str) -> bool {
+    matches_pathspec_with_context(spec, path, PathspecMatchContext::default())
+}
+
+/// Like [`matches_pathspec`], but uses `ctx` for trailing-`/` literal pathspecs and for
+/// wildcard pathspecs where the pattern continues after a directory boundary (Git
+/// `matches_pathspec` + directory semantics).
+#[must_use]
+pub(crate) fn matches_pathspec_with_context(
+    spec: &str,
+    path: &str,
+    ctx: PathspecMatchContext,
+) -> bool {
+    let spec_nfc: Cow<'_, str> = if ctx.precompose_paths {
+        precompose_utf8_path(spec)
+    } else {
+        Cow::Borrowed(spec)
+    };
+    let path_nfc: Cow<'_, str> = if ctx.precompose_paths {
+        precompose_utf8_path(path)
+    } else {
+        Cow::Borrowed(path)
+    };
+    let spec = spec_nfc.as_ref();
+    let path = path_nfc.as_ref();
+
+    let trimmed = spec.strip_prefix("./").unwrap_or(spec);
+    if trimmed == "." || trimmed.is_empty() {
+        return true;
+    }
+
+    let (elem_magic, raw_pattern) = parse_element_magic(trimmed, ctx.globals);
+    let magic = combine_magic(elem_magic, ctx.globals);
+
+    if magic.literal && magic.glob {
+        return false;
+    }
+    if magic.exclude {
+        return false;
+    }
+
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+
+    if magic.literal {
+        if let Some(prefix) = pattern.strip_suffix('/') {
+            if path_is_under_dir(path_for_match, prefix, false) {
+                return true;
+            }
+            if path_for_match == prefix {
+                return ctx.is_directory || ctx.is_git_submodule;
+            }
+            return false;
+        }
+        return path_for_match == pattern || path_is_under_dir(path_for_match, pattern, false);
+    }
+
+    // No wildcards and trailing `/`: directory-only semantics (Git `matches_pathspec`).
+    if let Some(prefix) = pattern.strip_suffix('/') {
+        if simple_length(pattern) == pattern.len() {
+            if path_is_under_dir(path_for_match, prefix, false) {
+                return true;
+            }
+            if path_for_match == prefix {
+                return ctx.is_directory || ctx.is_git_submodule;
+            }
+            return false;
+        }
+    }
+
+    if pathspec_matches_tail(pattern, path_for_match, magic) {
+        return true;
+    }
+
+    if (ctx.is_directory || ctx.is_git_submodule)
+        && !path_for_match.is_empty()
+        && pattern.len() > path_for_match.len()
+        && pattern.as_bytes().get(path_for_match.len()) == Some(&b'/')
+        && pattern.starts_with(path_for_match)
+        && simple_length(pattern) < pattern.len()
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Parse a Git mode string (e.g. `100644`, `040000`) into a [`PathspecMatchContext`].
+#[must_use]
+#[cfg(test)]
+pub(crate) fn context_from_mode_octal(mode: &str) -> PathspecMatchContext {
+    let Ok(bits) = u32::from_str_radix(mode, 8) else {
+        return PathspecMatchContext::default();
+    };
+    context_from_mode_bits(bits)
+}
+
+/// Classify a raw Git mode (e.g. from an index or tree entry) for pathspec matching.
+#[must_use]
+pub(crate) fn context_from_mode_bits(mode: u32) -> PathspecMatchContext {
+    let ty = mode & 0o170000;
+    PathspecMatchContext {
+        is_directory: ty == 0o040000,
+        is_git_submodule: ty == 0o160000,
+        precompose_paths: false,
+        ..PathspecMatchContext::default()
+    }
+}
+
+/// Pathspec matching for `ls-tree` after Git forces `pathspec.has_wildcard = 0` (`ls-tree.c`).
+///
+/// Metacharacters `*` / `?` still participate in [`wildmatch`]; `[` and `\\` are **not** glob
+/// starters unless a `*` or `?` appears — so `a[a]` matches the literal directory `a[a]` (t3102),
+/// while `a*` matches `a/one`, `aa/two`, `a[a]/three`, …
+#[must_use]
+#[cfg(test)]
+pub(crate) fn matches_ls_tree_pathspec(
+    spec: &str,
+    path: &str,
+    mode: u32,
+    attr_rules: &[AttrRule],
+) -> bool {
+    let globals = PathspecGlobalFlags::default();
+    let (elem_magic, raw_pattern) = parse_element_magic(spec, globals);
+    let mut magic = combine_magic(elem_magic, globals);
+    magic.exclude = false;
+
+    if magic.literal && magic.glob {
+        return false;
+    }
+
+    let ctx = context_from_mode_bits(mode);
+    let is_dir_for_attr = path.ends_with('/') || ctx.is_directory || ctx.is_git_submodule;
+
+    if !magic.attr_requirements.is_empty()
+        && !attr_requirements_match(
+            &magic.attr_requirements,
+            AttrLookup::rules_only(attr_rules),
+            path,
+            is_dir_for_attr,
+            mode,
+        )
+    {
+        return false;
+    }
+
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+
+    if magic.literal || magic.glob || magic.icase {
+        return pathspec_matches_tail(pattern, path_for_match, magic);
+    }
+
+    let spec_nfc: Cow<'_, str> = Cow::Borrowed(pattern);
+    let path_nfc: Cow<'_, str> = Cow::Borrowed(path_for_match);
+    let pattern = spec_nfc.as_ref();
+    let path = path_nfc.as_ref();
+
+    let trimmed = pattern.strip_prefix("./").unwrap_or(pattern);
+    if trimmed == "." || trimmed.is_empty() {
+        return true;
+    }
+
+    let uses_star_or_question = trimmed.contains('*') || trimmed.contains('?');
+    if !uses_star_or_question {
+        return ls_tree_literal_match(trimmed, path, ctx);
+    }
+
+    let nwl = simple_length(trimmed);
+    let flags = 0u32;
+    if nwl == trimmed.len() {
+        return wildmatch(trimmed.as_bytes(), path.as_bytes(), flags);
+    }
+    let lit = trimmed.as_bytes().get(..nwl).unwrap_or_default();
+    let path_b = path.as_bytes();
+    if path_b.len() < nwl {
+        return false;
+    }
+    if &path_b[..nwl] != lit {
+        return false;
+    }
+    let pat_rest = &trimmed[nwl..];
+    let path_rest = &path[nwl..];
+    wildmatch(pat_rest.as_bytes(), path_rest.as_bytes(), flags)
+}
+
+fn matches_pathspec_for_object_with_attrs(
+    spec: &str,
+    path: &str,
+    mode: u32,
+    attrs: AttrLookup<'_>,
+) -> bool {
+    let globals = PathspecGlobalFlags::default();
+    let (elem_magic, raw_pattern) = parse_element_magic(spec, globals);
+    let mut magic = combine_magic(elem_magic, globals);
+    magic.exclude = false;
+
+    if magic.literal && magic.glob {
+        return false;
+    }
+
+    let ctx = context_from_mode_bits(mode);
+    let is_dir_for_attr = path.ends_with('/') || ctx.is_directory || ctx.is_git_submodule;
+
+    if !magic.attr_requirements.is_empty()
+        && !attr_requirements_match(&magic.attr_requirements, attrs, path, is_dir_for_attr, mode)
+    {
+        return false;
+    }
+
+    let pattern = strip_top_magic(raw_pattern);
+    let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
+        match path_for_match_under_magic_prefix(path, prefix) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        path
+    };
+    if magic.literal || magic.glob || magic.icase {
+        pathspec_matches_tail(pattern, path_for_match, magic)
+    } else {
+        matches_pathspec_with_context(pattern, path_for_match, ctx)
+    }
+}
+
+/// Resolved path lies outside the repository work tree (Git `prefix_path_gently` failure).
+#[derive(Debug, Clone)]
+pub struct PathOutsideRepository {
+    /// User-facing pathspec token (argv element).
+    pub elt: String,
+    /// Resolved absolute path outside the work tree.
+    pub path: String,
+    /// Canonical work tree root.
+    pub work_tree: PathBuf,
+}
+
+impl std::fmt::Display for PathOutsideRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: '{}' is outside repository at '{}'",
+            self.elt,
+            self.path,
+            self.work_tree.display()
+        )
+    }
+}
+
+impl From<PathOutsideRepository> for PathspecResolveError {
+    fn from(outside: PathOutsideRepository) -> Self {
+        Self::OutsideRepository {
+            elt: outside.elt,
+            path: outside.path,
+            work_tree: outside.work_tree.display().to_string(),
+        }
+    }
+}
+
+/// Resolve a magic pathspec relative to a current-directory prefix.
+///
+/// This keeps the `cwd` prefix case-sensitive (via an internal `prefix:` magic
+/// token) while still honoring magic options like `icase` for the tail.
+/// Specs that include `top` (or short `:/`) stay repo-root-relative: the tail is
+/// not prefixed with the process cwd and no `prefix:` token is injected.
+/// Returns `None` when `spec` is not a parseable magic pathspec.
+pub fn resolve_magic_pathspec(spec: &str, cwd_prefix: &str) -> Option<String> {
+    if !spec.starts_with(":(") {
+        return None;
+    }
+    let close_idx = spec.find(')')?;
+    let magic_prefix = &spec[..=close_idx];
+    let tail = &spec[close_idx + 1..];
+    Some(resolve_magic_pathspec_parts(magic_prefix, tail, cwd_prefix))
+}
+
+/// Whether `token` is a long-form magic pathspec (`:(...)`) rather than a revision name.
+#[must_use]
+pub fn is_long_magic_pathspec_token(token: &str) -> bool {
+    resolve_magic_pathspec(token, "").is_some()
+}
+
+fn resolve_magic_pathspec_parts(magic_prefix: &str, tail: &str, cwd_prefix: &str) -> String {
+    if has_magic_prefix_token(magic_prefix) {
+        return format!("{magic_prefix}{tail}");
+    }
+
+    if let Some(rooted_tail) = tail.strip_prefix('/') {
+        return format!("{magic_prefix}{}", normalize_relative_path_str(rooted_tail));
+    }
+
+    if long_magic_prefix_has_top(magic_prefix) {
+        return format!("{magic_prefix}{tail}");
+    }
+
+    let combined = if cwd_prefix.is_empty() {
+        normalize_relative_path_str(tail)
+    } else {
+        normalize_relative_path_str(&format!("{cwd_prefix}{tail}"))
+    };
+
+    let cwd_base = normalize_relative_path_str(cwd_prefix.trim_end_matches('/'));
+    if !cwd_base.is_empty()
+        && (combined == cwd_base || combined.starts_with(&format!("{cwd_base}/")))
+    {
+        let after_base = combined
+            .strip_prefix(&cwd_base)
+            .unwrap_or(combined.as_str());
+        let remainder = after_base.strip_prefix('/').unwrap_or(after_base);
+        let magic_with_prefix = inject_magic_prefix_token(magic_prefix, &format!("{cwd_base}/"));
+        return format!("{magic_with_prefix}{remainder}");
+    }
+
+    format!("{magic_prefix}{combined}")
+}
+
+fn has_magic_prefix_token(magic_prefix: &str) -> bool {
+    let Some(inner) = magic_prefix
+        .strip_prefix(":(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return false;
+    };
+    inner
+        .split(',')
+        .map(str::trim)
+        .any(|token| token.starts_with("prefix:"))
+}
+
+fn long_magic_prefix_has_top(magic_prefix: &str) -> bool {
+    let Some(inner) = magic_prefix
+        .strip_prefix(":(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return false;
+    };
+    inner
+        .split(',')
+        .map(str::trim)
+        .any(|token| token.eq_ignore_ascii_case("top"))
+}
+
+fn inject_magic_prefix_token(magic_prefix: &str, prefix: &str) -> String {
+    let Some(inner) = magic_prefix
+        .strip_prefix(":(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return magic_prefix.to_string();
+    };
+    if inner.trim().is_empty() {
+        format!(":(prefix:{prefix})")
+    } else {
+        format!(":({inner},prefix:{prefix})")
+    }
+}
+
+/// Drop repeated leading `./` / `.//` from a repo-root pathspec (Git `prefix_path` behavior).
+///
+/// When stripping exposes a leading `:`, wrap with `:(literal)` so a filesystem path like
+/// `:!foo` is not reinterpreted as short exclude magic.
+fn normalize_repo_root_relative_pathspec(pathspec: &str) -> String {
+    let mut spec = pathspec;
+    let mut stripped = false;
+    while let Some(rest) = spec.strip_prefix("./") {
+        stripped = true;
+        spec = rest.trim_start_matches('/');
+    }
+    if !stripped {
+        return pathspec.to_owned();
+    }
+    if spec.is_empty() {
+        return ".".to_owned();
+    }
+    if spec.starts_with(':') && !literal_pathspecs_enabled() {
+        return format!(":(literal){spec}");
+    }
+    spec.to_owned()
+}
+
+/// Normalize user pathspec separators on Windows (`\` → `/`) before resolution.
+fn normalize_pathspec_separators(pathspec: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        if !pathspec.starts_with(':') && pathspec.contains('\\') {
+            return std::borrow::Cow::Owned(pathspec.replace('\\', "/"));
+        }
+    }
+    std::borrow::Cow::Borrowed(pathspec)
+}
+
+fn normalize_relative_path_str(path: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for component in std::path::Path::new(path).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(seg) => {
+                parts.push(seg.to_string_lossy().to_string());
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    parts.join("/")
+}
+
+/// Current directory relative to `work_tree`, or `None` if cwd is the work tree root.
+#[must_use]
+pub fn pathdiff(cwd: &Path, work_tree: &Path) -> Option<String> {
+    use crate::git_path::{path_for_disk_compare, path_to_git_slash};
+
+    let cwd_cmp = path_for_disk_compare(cwd);
+    let wt_cmp = path_for_disk_compare(work_tree);
+
+    if cwd_cmp == wt_cmp {
+        return None;
+    }
+
+    let rel = cwd_cmp.strip_prefix(&wt_cmp).ok()?;
+    let git = path_to_git_slash(rel);
+    if git.is_empty() {
+        None
+    } else {
+        Some(git)
+    }
+}
+
+/// For short exclude magic from a subdirectory, Git applies the worktree prefix to the pattern
+/// tail (via `prefix_path`) while keeping argv spelling. Long-form `:(exclude,prefix:…)` matches
+/// [`resolve_worktree_pathspec`] for `:(exclude)…` under a cwd prefix.
+fn prepend_cwd_to_short_exclude_pathspec(spec: &str, cwd: &str) -> Option<String> {
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        return None;
+    }
+    let globals = PathspecGlobalFlags::default();
+    let (elem_magic, pattern) = parse_element_magic(spec, globals);
+    let magic = combine_magic(elem_magic, globals);
+    if !magic.exclude || magic.top {
+        return None;
+    }
+    if pattern.is_empty() || pattern.starts_with('/') {
+        return None;
+    }
+    if magic.glob || magic.literal || magic.icase || !magic.attr_requirements.is_empty() {
+        return None;
+    }
+    Some(format!(":(exclude,prefix:{cwd}/){pattern}"))
+}
+
+/// Build [`PathspecMatchContext`] with optional NFC path normalization for comparisons.
+#[must_use]
+pub(crate) fn pathspec_match_context_with_precompose(
+    precompose_paths: bool,
+) -> PathspecMatchContext {
+    PathspecMatchContext {
+        precompose_paths,
+        ..PathspecMatchContext::default()
+    }
+}
+
+/// Like [`matches_pathspec_list`], with an explicit `precompose_paths` flag.
+#[must_use]
+#[cfg(test)]
+pub(crate) fn matches_pathspec_list_precompose(
+    path: &str,
+    specs: &[String],
+    precompose_paths: bool,
+) -> bool {
+    matches_pathspec_list_with_context(
+        path,
+        specs,
+        pathspec_match_context_with_precompose(precompose_paths),
+    )
+}
+
+/// True when argv pathspec strings must not be NFC-normalized (magic syntax).
+#[must_use]
+pub(crate) fn argv_pathspec_preserves_spelling(pathspec: &str) -> bool {
+    pathspec.starts_with(":(")
+        || pathspec.starts_with(":/")
+        || pathspec.starts_with(":!")
+        || pathspec.starts_with(":^")
+}
+
+/// NFC-normalize a literal command-line pathspec (Git `precompose_argv_prefix`).
+#[must_use]
+pub fn precompose_argv_pathspec(pathspec: &str) -> Cow<'_, str> {
+    if argv_pathspec_preserves_spelling(pathspec) {
+        Cow::Borrowed(pathspec)
+    } else {
+        precompose_utf8_path(pathspec)
+    }
+}
+
+/// Resolve a pathspec string to a path relative to the repository work tree.
+///
+/// `prefix` is the current directory relative to the work tree (no trailing slash),
+/// or `None` when cwd is the work tree root.
+#[must_use]
+pub(crate) fn resolve_pathspec(pathspec: &str, work_tree: &Path, prefix: Option<&str>) -> String {
+    resolve_pathspec_with_argv_precompose(pathspec, work_tree, prefix, false)
+}
+
+/// Like `resolve_pathspec`, but NFC-normalizes literal argv path segments when requested.
+#[must_use]
+pub fn resolve_pathspec_with_argv_precompose(
+    pathspec: &str,
+    work_tree: &Path,
+    prefix: Option<&str>,
+    argv_precompose: bool,
+) -> String {
+    let pathspec = if argv_precompose {
+        precompose_argv_pathspec(pathspec)
+    } else {
+        Cow::Borrowed(pathspec)
+    };
+    resolve_pathspec_impl(pathspec.as_ref(), work_tree, prefix)
+}
+
+fn resolve_pathspec_impl(pathspec: &str, work_tree: &Path, prefix: Option<&str>) -> String {
+    let pathspec = normalize_pathspec_separators(pathspec);
+    let pathspec = pathspec.as_ref();
+    // Git: `.` at repo root means "match the whole tree" (not an empty pathspec).
+    // An empty resolved pathspec would match nothing and breaks `grep -- . t` max-depth.
+    if pathspec == "." {
+        return match prefix {
+            Some(p) if !p.is_empty() => p.to_owned(),
+            _ => ".".to_owned(),
+        };
+    }
+    if pathspec.contains("../") || pathspec.starts_with("../") {
+        let cwd = match prefix.filter(|p| !p.is_empty()) {
+            Some(p) => work_tree.join(p),
+            None => work_tree.to_path_buf(),
+        };
+        let abs = cwd.join(pathspec);
+        let mut parts: Vec<std::ffi::OsString> = Vec::new();
+        for component in abs.components() {
+            use std::path::Component;
+            match component {
+                Component::ParentDir => {
+                    parts.pop();
+                }
+                Component::CurDir => {}
+                other => parts.push(other.as_os_str().to_os_string()),
+            }
+        }
+        let abs_norm: PathBuf = parts.iter().collect();
+        if let Some(rel) = crate::git_path::strip_worktree_prefix(&abs_norm, work_tree) {
+            return rel;
+        }
+    }
+    if Path::new(pathspec).is_absolute() {
+        let abs = Path::new(pathspec);
+        if let Some(rel) = crate::git_path::strip_worktree_prefix(abs, work_tree) {
+            return rel;
+        }
+        return pathspec.to_owned();
+    }
+
+    if pathspec.starts_with(':') {
+        if let Some(p) = prefix {
+            if !p.is_empty() && !literal_pathspecs_enabled() {
+                let cwd_ps = format!("{}/", p.trim_end_matches('/'));
+                if pathspec.starts_with(":(") {
+                    if pathspec_has_top(pathspec) {
+                        return pathspec.to_owned();
+                    }
+                    if let Some(resolved) = resolve_magic_pathspec(pathspec, &cwd_ps) {
+                        return resolved;
+                    }
+                    return pathspec.to_owned();
+                }
+                if pathspec_is_exclude(pathspec) {
+                    if let Some(fixed) = prepend_cwd_to_short_exclude_pathspec(pathspec, p) {
+                        return fixed;
+                    }
+                }
+            }
+        }
+        if let Some(rest) = pathspec.strip_prefix(":/") {
+            // `:/!foo` / `:/^bar` — `:/` is `:(top)`; the tail is still short magic, not a literal path.
+            if rest.starts_with('!') || rest.starts_with('^') {
+                return pathspec.to_owned();
+            }
+            return rest.to_owned();
+        }
+        // Long magic `:(...)` must stay intact — `:(exclude)path` is not the same as `path`
+        // (t6132-pathspec-exclude, grep --untracked with exclude pathspecs).
+        if pathspec.starts_with(":(") {
+            return pathspec.to_owned();
+        }
+        return pathspec.to_owned();
+    }
+
+    match prefix {
+        Some(p) if !p.is_empty() => {
+            normalize_relative_path_str(&PathBuf::from(p).join(pathspec).to_string_lossy())
+        }
+        _ => normalize_repo_root_relative_pathspec(pathspec),
+    }
+}
+
+/// Resolve a pathspec and ensure it lies inside `work_tree` (used by `git add`, etc.).
+///
+/// NFC-normalizes `pathspec` when `argv_precompose` is set.
+///
+/// Callers holding a [`Repository`] should use [`Repository::resolve_worktree_pathspec`], which
+/// computes `argv_precompose` once per handle instead of reloading config per pathspec.
+pub(crate) fn resolve_pathspec_in_worktree_with_argv_precompose(
+    elt: &str,
+    pathspec: &str,
+    work_tree: &Path,
+    prefix: Option<&str>,
+    argv_precompose: bool,
+) -> Result<String, PathOutsideRepository> {
+    let resolved =
+        resolve_pathspec_with_argv_precompose(pathspec, work_tree, prefix, argv_precompose);
+    if Path::new(&resolved).is_absolute() {
+        let wt = work_tree
+            .canonicalize_simplified()
+            .unwrap_or_else(|_| work_tree.to_path_buf());
+        return Err(PathOutsideRepository {
+            elt: elt.to_string(),
+            path: resolved,
+            work_tree: wt,
+        });
+    }
+    Ok(resolved)
+}
+
+/// Normalize a worktree file path for porcelain commands (`blame`, `log`, …).
+///
+/// Accepts repo-relative or absolute paths under `work_tree`.
+#[must_use]
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn normalize_worktree_file_path(
+    file_path: &str,
+    work_tree: &Path,
+    prefix: Option<&str>,
+) -> String {
+    normalize_worktree_file_path_with_git_dir(file_path, work_tree, prefix, None)
+}
+
+/// Like [`normalize_worktree_file_path`], honoring `core.precomposeunicode` argv normalization for `git_dir`.
+#[must_use]
+pub(crate) fn normalize_worktree_file_path_with_git_dir(
+    file_path: &str,
+    work_tree: &Path,
+    prefix: Option<&str>,
+    git_dir: Option<&Path>,
+) -> String {
+    let argv_precompose = argv_precompose_enabled(git_dir);
+    let resolved =
+        resolve_pathspec_with_argv_precompose(file_path, work_tree, prefix, argv_precompose);
+    if Path::new(&resolved).is_absolute() {
+        file_path.to_string()
+    } else {
+        resolved
+    }
+}
+
+#[cfg(test)]
+mod tree_entry_pathspec_tests {
+    use super::*;
+
+    #[test]
+    fn t6130_bracket_filename_matches_pathspec() {
+        assert!(matches_pathspec("f[o][o]", "f[o][o]"));
+        assert!(matches_pathspec(":(glob)f[o][o]", "f[o][o]"));
+    }
+
+    #[test]
+    fn literal_prefix_and_exact() {
+        assert!(matches_pathspec("path1", "path1/file1"));
+        assert!(matches_pathspec_with_context(
+            "path1/",
+            "path1/file1",
+            PathspecMatchContext::default()
+        ));
+        assert!(matches_pathspec("file0", "file0"));
+        assert!(!matches_pathspec("path", "path1/file1"));
+    }
+
+    #[test]
+    fn dir_prefix_needs_slash_boundary() {
+        assert!(matches_pathspec("a/b", "a/b/c"));
+        assert!(!matches_pathspec("a/b", "a/bc"));
+        assert!(!matches_pathspec("a/b", "a"));
+        assert!(matches_pathspec(":(literal)dir", "dir/x"));
+        assert!(!matches_pathspec(":(literal)dir", "dirx"));
+        assert!(matches_pathspec(":(icase)DIR", "dir/x"));
+        assert!(!matches_pathspec(":(icase)DIR", "dirx"));
+        assert!(matches_pathspec("dir/", "dir/x"));
+        assert!(!matches_pathspec("dir/", "dir"));
+    }
+
+    #[test]
+    fn sorted_lookup_agrees_with_linear_scan() {
+        let mut paths: Vec<&str> = vec![
+            "a",
+            "a-b",
+            "a.txt",
+            "a/b",
+            "a/b/c.txt",
+            "a/bc",
+            "a0",
+            "b/x[1].txt",
+            "dir/sub/file",
+            "dir-sub",
+            "f[o][o]",
+            "z",
+            "caf\u{e9}/menu",
+            "cafe\u{301}/old",
+            "\u{212a}.txt",
+        ];
+        paths.sort_unstable();
+        let specs = [
+            "caf\u{e9}",
+            "cafe\u{301}/",
+            "cafe\u{301}/old",
+            "K.txt",
+            "\u{212a}.txt",
+            "a",
+            "a/",
+            "a/b",
+            "a/b/",
+            "a/bc",
+            "a-",
+            "a-b",
+            "a.txt",
+            "b",
+            "b/",
+            "dir",
+            "dir/sub",
+            "dir/sub/",
+            "dir/su",
+            "dir-sub",
+            "f[o][o]",
+            "*.txt",
+            "a/*",
+            ":(glob)**/*.txt",
+            ":(literal)f[o][o]",
+            ":(icase)A/B",
+            ":!a",
+            ".",
+            "./a/b",
+            "",
+            "z",
+            "zz",
+            "/",
+            "a//",
+        ];
+        for ctx in [
+            PathspecMatchContext::default(),
+            PathspecMatchContext {
+                precompose_paths: true,
+                ..PathspecMatchContext::default()
+            },
+            PathspecMatchContext {
+                is_directory: true,
+                ..PathspecMatchContext::default()
+            },
+        ] {
+            for spec in specs {
+                let list = [spec.to_owned()];
+                let linear = paths
+                    .iter()
+                    .any(|p| matches_pathspec_list_with_context(p, &list, ctx));
+                assert_eq!(
+                    sorted_paths_match_pathspec(spec, &paths, ctx),
+                    linear,
+                    "spec {spec:?} ctx {ctx:?}"
+                );
+            }
+        }
+        let empty: [&str; 0] = [];
+        assert!(!sorted_paths_match_pathspec(
+            "a",
+            &empty,
+            PathspecMatchContext::default()
+        ));
+    }
+
+    #[test]
+    fn list_matcher_agrees_with_linear_matching() {
+        let paths = [
+            "a",
+            "a-b",
+            "a.txt",
+            "a/",
+            "a/b",
+            "a/b/c.txt",
+            "a/bc",
+            "a//x",
+            "a0",
+            "b/x[1].txt",
+            "dir/sub/file",
+            "dir-sub",
+            "f[o][o]",
+            "z",
+            "zz/a",
+            "é/x",
+            "e\u{301}/y",
+            "\u{212a}.txt",
+            "K.txt",
+            "",
+        ];
+        let lists: &[&[&str]] = &[
+            &[],
+            &["a"],
+            &["a/"],
+            &["a//"],
+            &["a/b", "dir/sub/", "z"],
+            &["a/b/", "a/bc", "dir", "zz"],
+            &["dir/su", "dir-sub", "f[o][o]"],
+            &["é", "a-"],
+            &["e\u{301}", "z"],
+            &["e\u{301}/y", "K.txt"],
+            &["\u{212a}.txt"],
+            &["a", "*.txt"],
+            &["dir", ":!dir/sub"],
+            &[":!a"],
+            &["./a", "z"],
+            &[".", "a"],
+            &["", "a"],
+            &[":(icase)A/B", "z"],
+        ];
+        for ctx in [
+            PathspecMatchContext::default(),
+            PathspecMatchContext {
+                precompose_paths: true,
+                ..PathspecMatchContext::default()
+            },
+            PathspecMatchContext {
+                is_directory: true,
+                ..PathspecMatchContext::default()
+            },
+        ] {
+            for list in lists {
+                let specs: Vec<String> = list.iter().map(|s| (*s).to_owned()).collect();
+                let matcher = PathspecListMatcher::new(&specs, ctx);
+                for path in paths {
+                    assert_eq!(
+                        matcher.matches(path),
+                        matches_pathspec_list_with_context(path, &specs, ctx),
+                        "path {path:?} specs {specs:?} ctx {ctx:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn list_matcher_uses_literal_lookup_only_for_plain_lists() {
+        let ctx = PathspecMatchContext::default();
+        let plain = vec!["a/b".to_owned(), "dir/".to_owned()];
+        assert!(PathspecListMatcher::new(&plain, ctx).literals.is_some());
+        let glob = vec!["a/b".to_owned(), "*.txt".to_owned()];
+        assert!(PathspecListMatcher::new(&glob, ctx).literals.is_none());
+        let exclude = vec!["a/b".to_owned(), ":!a/b/c".to_owned()];
+        assert!(PathspecListMatcher::new(&exclude, ctx).literals.is_none());
+        assert!(PathspecListMatcher::new(&[], ctx).literals.is_none());
+    }
+
+    #[test]
+    fn precomposed_literal_specs_keep_fast_lookups() {
+        let ctx = PathspecMatchContext {
+            precompose_paths: true,
+            ..PathspecMatchContext::default()
+        };
+        let specs: Vec<String> = (0..100).map(|i| format!("d{i}/file.txt")).collect();
+        let matcher = PathspecListMatcher::new(&specs, ctx);
+        assert!(
+            matcher.literals.is_some(),
+            "core.precomposeunicode must not force a per-spec scan of every path"
+        );
+        assert!(matcher.matches("d42/file.txt"));
+        assert!(!matcher.matches("d42/other.txt"));
+        let nfd = vec!["cafe\u{301}".to_owned()];
+        let matcher = PathspecListMatcher::new(&nfd, ctx);
+        assert!(matcher.literals.is_some());
+        assert!(matcher.matches("caf\u{e9}/menu"));
+        assert!(matcher.matches("cafe\u{301}/menu"));
+        assert!(exact_literal_pathspec_set(&specs, ctx).is_none());
+    }
+
+    #[test]
+    fn ls_tree_bracket_in_name_is_literal_prefix() {
+        assert!(matches_ls_tree_pathspec(
+            "a[a]",
+            "a[a]/three",
+            0o100644,
+            &[]
+        ));
+        assert!(!matches_pathspec_with_context(
+            "a[a]",
+            "a[a]/three",
+            PathspecMatchContext::default()
+        ));
+    }
+
+    #[test]
+    fn wildcards_cross_slash_by_default() {
+        assert!(matches_pathspec("f*", "file0"));
+        assert!(matches_pathspec("*file1", "path1/file1"));
+        assert!(matches_pathspec_with_context(
+            "path1/f*",
+            "path1",
+            PathspecMatchContext {
+                is_directory: true,
+                ..Default::default()
+            }
+        ));
+        assert!(matches_pathspec("path1/*file1", "path1/file1"));
+    }
+
+    #[test]
+    fn glob_double_star_txt_at_repo_root() {
+        assert!(pathspec_matches(":(glob)**/*.txt", "untracked.txt"));
+        assert!(pathspec_matches(":(glob)**/*.txt", "d/untracked.txt"));
+    }
+
+    #[test]
+    fn trailing_slash_directory_only() {
+        assert!(!matches_pathspec_with_context(
+            "file0/",
+            "file0",
+            PathspecMatchContext::default()
+        ));
+        assert!(matches_pathspec_with_context(
+            "file0/",
+            "file0",
+            PathspecMatchContext {
+                is_directory: true,
+                ..Default::default()
+            }
+        ));
+        assert!(matches_pathspec_with_context(
+            "submod/",
+            "submod",
+            PathspecMatchContext {
+                is_git_submodule: true,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn exclude_top_short_magic_subtracts_from_positive() {
+        let specs = vec!["*".to_string(), ":/!sub2".to_string()];
+        assert!(matches_pathspec_list("sub/file", &specs));
+        assert!(!matches_pathspec_list("sub2/file", &specs));
+        assert!(pathspec_exclude_matches(":/!sub2", "sub2/file"));
+    }
+}
+
+#[cfg(test)]
+mod exact_literal_pathspec_set_tests {
+    use super::*;
+
+    #[test]
+    fn exact_literal_pathspec_set_accepts_file_paths() {
+        let ctx = PathspecMatchContext::default();
+        let set = exact_literal_pathspec_set(&["large.txt".to_string()], ctx).expect("set");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("large.txt"));
+    }
+
+    #[test]
+    fn exact_literal_pathspec_set_rejects_directory_trailing_slash() {
+        let ctx = PathspecMatchContext::default();
+        assert!(exact_literal_pathspec_set(&["src/".to_string()], ctx).is_none());
+    }
+
+    #[test]
+    fn exact_literal_pathspec_set_rejects_glob_magic() {
+        let ctx = PathspecMatchContext::default();
+        assert!(exact_literal_pathspec_set(&[":(glob)*.rs".to_string()], ctx).is_none());
+    }
+}
+
+#[cfg(test)]
+mod pathspec_list_tests {
+    use super::*;
+    use crate::crlf::parse_gitattributes_content;
+
+    #[test]
+    fn exclude_removes_paths_matching_icase_positive() {
+        let specs = vec![
+            ":(icase)*.txt".to_string(),
+            ":(exclude)submodule/subsub/*".to_string(),
+        ];
+        assert!(path_allowed_by_pathspec_list(&specs, "submodule/g.txt"));
+        assert!(!path_allowed_by_pathspec_list(
+            &specs,
+            "submodule/subsub/e.txt"
+        ));
+    }
+
+    #[test]
+    fn prefixed_attr_exclude_removes_matching_child_path() {
+        let specs = vec![
+            "sub".to_string(),
+            ":(exclude,attr:labelB,prefix:sub/)".to_string(),
+        ];
+        let exclude_only = vec![":(exclude,attr:labelB,prefix:sub/)".to_string()];
+        let attrs = parse_gitattributes_content("fileB labelB\n");
+        assert!(!matches_pathspec_list_for_object(
+            "sub/fileB",
+            0o100644,
+            &attrs,
+            &specs,
+        ));
+        assert!(!matches_pathspec_list_for_object(
+            "sub/fileB",
+            0o100644,
+            &attrs,
+            &exclude_only,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod resolve_pathspec_tests {
+    use super::*;
+
+    fn wt() -> PathBuf {
+        PathBuf::from("/tmp/grit-pathspec-worktree")
+    }
+
+    #[test]
+    fn strips_leading_dot_slash_at_repo_root() {
+        let wt = wt();
+        assert_eq!(resolve_pathspec("./-", &wt, None), "-");
+        assert_eq!(resolve_pathspec("./a/b", &wt, None), "a/b");
+        assert_eq!(resolve_pathspec("././a", &wt, None), "a");
+        assert_eq!(resolve_pathspec(".//a", &wt, None), "a");
+        assert_eq!(resolve_pathspec("./", &wt, None), ".");
+        assert_eq!(resolve_pathspec(".", &wt, None), ".");
+    }
+
+    #[test]
+    fn prefixed_cwd_resolution_unchanged() {
+        let wt = wt();
+        assert_eq!(
+            resolve_pathspec("file", &wt, Some("sub/dir")),
+            "sub/dir/file"
+        );
+        assert_eq!(resolve_pathspec(":(glob)*.rs", &wt, None), ":(glob)*.rs");
+    }
+
+    #[test]
+    fn dot_slash_colon_filename_stays_literal_not_exclude_magic() {
+        let wt = wt();
+        let resolved = resolve_pathspec("./:!foo", &wt, None);
+        assert_eq!(resolved, ":(literal):!foo");
+        assert!(!pathspec_is_exclude(&resolved));
+        assert!(pathspec_matches(&resolved, ":!foo"));
+        assert!(!pathspec_matches(&resolved, "other"));
+    }
+
+    #[test]
+    fn repository_path_as_literal_pathspec_matches_exact_object_path() {
+        let magic = ":(literal)foo";
+        let spec = super::repository_path_as_literal_pathspec(magic);
+        assert!(matches_pathspec_list(magic, std::slice::from_ref(&spec)));
+        assert!(!matches_pathspec_list("foo", std::slice::from_ref(&spec)));
+    }
+
+    #[test]
+    fn resolve_absolute_path_under_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt = tmp.path().join("repo");
+        std::fs::create_dir_all(wt.join("d")).expect("mkdir");
+        let file = wt.join("d/b.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let wt = wt.canonicalize_simplified().expect("canonicalize");
+        let abs = file.canonicalize_simplified().expect("canonicalize file");
+        let spec = abs.to_string_lossy();
+        assert_eq!(
+            resolve_pathspec(&spec, &wt, None),
+            "d/b.txt",
+            "absolute forward-slash pathspec"
+        );
+    }
+
+    #[cfg(windows)]
+    mod windows {
+        use super::*;
+
+        #[test]
+        fn resolve_backslash_relative_and_absolute_pathspecs() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let wt = tmp.path().join("repo");
+            std::fs::create_dir_all(wt.join("d")).expect("mkdir");
+            let file_a = wt.join("d/a.txt");
+            let file_b = wt.join("d/b.txt");
+            std::fs::write(&file_a, b"a").expect("write");
+            std::fs::write(&file_b, b"b").expect("write");
+            let wt = wt.canonicalize_simplified().expect("canonicalize worktree");
+
+            assert_eq!(
+                resolve_pathspec(r"d\a.txt", &wt, None),
+                "d/a.txt",
+                "backslash relative pathspec (issue #915 A)"
+            );
+
+            let abs_back = file_b.canonicalize_simplified().expect("canonicalize");
+            let abs_back_spec = abs_back.display().to_string();
+            assert_eq!(
+                resolve_pathspec(&abs_back_spec, &wt, None),
+                "d/b.txt",
+                "absolute backslash pathspec (issue #915 B)"
+            );
+
+            let abs_forward = abs_back_spec.replace('\\', "/");
+            assert_eq!(
+                resolve_pathspec(&abs_forward, &wt, None),
+                "d/b.txt",
+                "absolute forward-slash pathspec (issue #915 C)"
+            );
+        }
+    }
+
+    #[test]
+    fn nfd_pathspec_matches_nfc_index_path_when_precompose_enabled() {
+        let nfc_path = "caf\u{00e9}.txt";
+        let nfd_spec = format!("cafe\u{0301}.txt");
+        assert!(!matches_pathspec_list(&nfc_path, &[nfd_spec.clone()]));
+        assert!(matches_pathspec_list_precompose(
+            nfc_path,
+            &[nfd_spec.clone()],
+            true
+        ));
+    }
+
+    #[test]
+    fn argv_precompose_normalizes_nfd_literal_pathspec() {
+        let nfd = format!("cafe\u{0301}.txt");
+        let nfc = precompose_argv_pathspec(&nfd);
+        assert_eq!(nfc.as_ref(), "caf\u{00e9}.txt");
+        assert!(argv_pathspec_preserves_spelling(":(glob)*.rs"));
+        assert_eq!(
+            precompose_argv_pathspec(":(glob)*.rs").as_ref(),
+            ":(glob)*.rs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolved_pathspecs_tests {
+    use super::*;
+    use crate::repo::{InitOptions, Repository};
+
+    fn repo_with_tree() -> (tempfile::TempDir, Repository) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        std::fs::write(dir.path().join("top.txt"), b"a").expect("write");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+        std::fs::write(dir.path().join("sub/inner.txt"), b"b").expect("write");
+        (dir, repo)
+    }
+
+    #[test]
+    fn resolved_pathspecs_subdir_prefix() {
+        let (dir, repo) = repo_with_tree();
+        let sub = dir.path().join("sub");
+        let resolved =
+            ResolvedPathspecs::resolve(&repo, &sub, &["inner.txt".to_string()], None).expect("ok");
+        assert_eq!(resolved.specs, ["sub/inner.txt"]);
+        assert!(resolved.scoped);
+    }
+
+    #[test]
+    fn resolved_pathspecs_top_level_magic() {
+        let (dir, repo) = repo_with_tree();
+        let resolved =
+            ResolvedPathspecs::resolve(&repo, dir.path(), &[":/top.txt".to_string()], None)
+                .expect("ok");
+        assert_eq!(resolved.specs, ["top.txt"]);
+    }
+
+    #[test]
+    fn resolved_pathspecs_parent_outside_repo() {
+        let (dir, repo) = repo_with_tree();
+        let outside = dir.path().parent().expect("parent").join("outside.txt");
+        std::fs::write(&outside, b"x").expect("write outside");
+        let spec = outside.to_string_lossy().into_owned();
+        let err =
+            ResolvedPathspecs::resolve(&repo, dir.path(), &[spec], None).expect_err("outside");
+        assert!(matches!(
+            err,
+            PathspecResolveError::OutsideRepository { .. }
+        ));
+    }
+
+    #[test]
+    fn resolved_pathspecs_empty_argv() {
+        let (dir, repo) = repo_with_tree();
+        let err = ResolvedPathspecs::resolve(&repo, dir.path(), &[String::new()], None)
+            .expect_err("empty");
+        assert_eq!(err, PathspecResolveError::EmptyPathspec);
+    }
+
+    #[test]
+    fn resolved_pathspecs_from_file_lf_and_quoted() {
+        let (dir, repo) = repo_with_tree();
+        let input = PathspecFile::new(b"top.txt\n\"sub/inner.txt\"\n".to_vec(), false);
+        let resolved = ResolvedPathspecs::resolve(&repo, dir.path(), &[], Some(input)).expect("ok");
+        assert_eq!(resolved.specs, ["top.txt", "sub/inner.txt"]);
+    }
+
+    #[test]
+    fn resolved_pathspecs_from_file_nul() {
+        let (dir, repo) = repo_with_tree();
+        let input = PathspecFile::new(b"top.txt\0sub/\0".to_vec(), true);
+        let resolved = ResolvedPathspecs::resolve(&repo, dir.path(), &[], Some(input)).expect("ok");
+        assert_eq!(resolved.specs, ["top.txt", "sub/"]);
+    }
+
+    #[test]
+    fn resolved_pathspecs_from_file_nul_preserves_literal_bytes() {
+        let (dir, repo) = repo_with_tree();
+        std::fs::write(dir.path().join("  spaced  "), b"x").expect("write");
+        let quoted_dir = dir.path().join("\"double\"");
+        std::fs::create_dir_all(&quoted_dir).expect("mkdir");
+        std::fs::write(quoted_dir.join("f"), b"y").expect("write");
+        let input = PathspecFile::new(b"  spaced  \0\"double\"\0".to_vec(), true);
+        let resolved = ResolvedPathspecs::resolve(&repo, dir.path(), &[], Some(input)).expect("ok");
+        assert_eq!(resolved.sources, ["  spaced  ", "\"double\""]);
+    }
+
+    #[test]
+    fn resolved_pathspecs_from_file_blank_line_errors() {
+        let (dir, repo) = repo_with_tree();
+        let input = PathspecFile::new(b"\n".to_vec(), false);
+        let err = ResolvedPathspecs::resolve(&repo, dir.path(), &[], Some(input)).expect_err("err");
+        assert_eq!(err, PathspecResolveError::EmptyPathspec);
+    }
+
+    #[test]
+    fn resolved_pathspecs_from_file_nul_empty_record_errors() {
+        let (dir, repo) = repo_with_tree();
+        let input = PathspecFile::new(b"a\0\0b".to_vec(), true);
+        let err = ResolvedPathspecs::resolve(&repo, dir.path(), &[], Some(input)).expect_err("err");
+        assert_eq!(err, PathspecResolveError::EmptyPathspec);
+    }
+
+    #[test]
+    fn resolved_pathspecs_from_file_invalid_quote() {
+        let (dir, repo) = repo_with_tree();
+        let input = PathspecFile::new(b"\"bad\\z\"\n".to_vec(), false);
+        let err = ResolvedPathspecs::resolve(&repo, dir.path(), &[], Some(input)).expect_err("err");
+        assert!(matches!(
+            err,
+            PathspecResolveError::FromFile(
+                PathspecFromFileParseError::InvalidEscapeSequence { .. }
+            )
+        ));
+        let input = PathspecFile::new(b"\"unterminated\n".to_vec(), false);
+        let err = ResolvedPathspecs::resolve(&repo, dir.path(), &[], Some(input)).expect_err("err");
+        assert!(matches!(
+            err,
+            PathspecResolveError::FromFile(PathspecFromFileParseError::InvalidCStyleQuoting { .. })
+        ));
+    }
+
+    #[test]
+    fn resolved_pathspecs_entire_tree_when_unscoped() {
+        let (dir, repo) = repo_with_tree();
+        let resolved = ResolvedPathspecs::resolve(&repo, dir.path(), &[], None).expect("ok");
+        assert!(!resolved.scoped);
+        assert!(resolved.specs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod resolve_magic_pathspec_tests {
+    use super::*;
+
+    #[test]
+    fn long_magic_token_predicate() {
+        assert!(is_long_magic_pathspec_token(":(attr:rust)"));
+        assert!(!is_long_magic_pathspec_token(":0:file"));
+        assert!(!is_long_magic_pathspec_token("main"));
+    }
+
+    #[test]
+    fn top_magic_does_not_inject_cwd_prefix() {
+        assert_eq!(
+            resolve_magic_pathspec(":(top)a/g.c", "a/b/").expect("magic"),
+            ":(top)a/g.c"
+        );
+        assert_eq!(
+            resolve_magic_pathspec(":(top,glob)a/**/*.c", "a/b/").expect("magic"),
+            ":(top,glob)a/**/*.c"
+        );
+        assert_eq!(
+            resolve_magic_pathspec(":(exclude,top)a/b", "a/b/").expect("magic"),
+            ":(exclude,top)a/b"
+        );
+    }
+
+    #[test]
+    fn non_top_magic_still_injects_prefix_from_subdirectory() {
+        assert_eq!(
+            resolve_magic_pathspec(":(glob)**/f.txt", "sub/").expect("magic"),
+            ":(glob,prefix:sub/)**/f.txt"
+        );
+        assert_eq!(
+            resolve_magic_pathspec(":(exclude)vendor", "sub/").expect("magic"),
+            ":(exclude,prefix:sub/)vendor"
+        );
+    }
+
+    #[test]
+    fn resolve_pathspec_top_from_subdirectory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wt = dir.path();
+        std::fs::create_dir_all(wt.join("a/b")).expect("mkdir");
+        assert_eq!(
+            resolve_pathspec(":(top)a/g.c", wt, Some("a/b")),
+            ":(top)a/g.c"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rev_walk_pathspec_resolution_tests {
+    use super::*;
+    use crate::config::environment::{Environment, RepositoryOptions};
+    use crate::repo::{InitOptions, Repository};
+
+    fn repo_from_sub(worktree: &std::path::Path, sub: &std::path::Path) -> Repository {
+        let mut env = Environment::empty();
+        env.cwd = sub.to_path_buf();
+        let mut opts = RepositoryOptions::empty();
+        opts.environment = env;
+        Repository::discover(Some(worktree), &opts).expect("discover")
+    }
+
+    #[test]
+    fn glob_magic_from_subdirectory_gets_prefix_and_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wt = dir.path();
+        std::fs::create_dir_all(wt.join("sub")).expect("mkdir");
+        std::fs::write(wt.join("sub/f.txt"), b"x").expect("write");
+        Repository::init(wt, &InitOptions::default()).expect("init");
+        let repo = repo_from_sub(wt, &wt.join("sub"));
+        let pathspec = Pathspec::scoped([":(glob)**/f.txt"], PathspecGlobalFlags::default());
+        let specs = repo.resolve_rev_walk_pathspecs(&pathspec).expect("resolve");
+        assert_eq!(specs, [":(glob,prefix:sub/)**/f.txt"]);
+        assert!(pathspec_matches(&specs[0], "sub/f.txt"));
+        assert!(!pathspec_matches(&specs[0], "other/f.txt"));
+    }
+
+    #[test]
+    fn short_exclude_from_subdirectory_uses_prefix_magic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wt = dir.path();
+        std::fs::create_dir_all(wt.join("sub")).expect("mkdir");
+        Repository::init(wt, &InitOptions::default()).expect("init");
+        let repo = repo_from_sub(wt, &wt.join("sub"));
+        let pathspec = Pathspec::scoped([":!f.txt"], PathspecGlobalFlags::default());
+        let specs = repo.resolve_rev_walk_pathspecs(&pathspec).expect("resolve");
+        assert_eq!(specs, [".", ":(exclude,prefix:sub/)f.txt"]);
+        assert!(matches_pathspec_list("other/g.txt", &specs));
+        assert!(!matches_pathspec_list("sub/f.txt", &specs));
+    }
+
+    #[test]
+    fn glob_with_prefix_descends_into_cwd_directory() {
+        let spec = ":(glob,prefix:sub/)**/f.txt";
+        assert!(pathspec_wants_descent_into_tree(spec, "sub"));
+        assert!(pathspec_entry_is_relevant(
+            "sub/f.txt",
+            false,
+            &[spec.to_owned()]
+        ));
+    }
+
+    #[test]
+    fn top_magic_from_subdirectory_stays_unprefixed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wt = dir.path();
+        std::fs::create_dir_all(wt.join("a/b")).expect("mkdir");
+        Repository::init(wt, &InitOptions::default()).expect("init");
+        let repo = repo_from_sub(wt, &wt.join("a/b"));
+        let pathspec = Pathspec::scoped([":(top)a/g.c"], PathspecGlobalFlags::default());
+        let specs = repo.resolve_rev_walk_pathspecs(&pathspec).expect("resolve");
+        assert_eq!(specs, [":(top)a/g.c"]);
+        assert!(pathspec_matches(&specs[0], "a/g.c"));
+        assert!(!pathspec_matches(&specs[0], "a/b/h.c"));
+    }
+}

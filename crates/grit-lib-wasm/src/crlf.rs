@@ -1,0 +1,2632 @@
+//! CRLF / EOL conversion and clean/smudge filter support.
+//!
+//! This module handles line-ending conversion when staging files (`git add`)
+//! and checking out files (`git checkout`, `read-tree -u`, `checkout-index`).
+//!
+//! Config knobs:
+//!   - `core.autocrlf` (true / input / false)
+//!   - `core.eol` (lf / crlf / native)
+//!   - `core.safecrlf` (true / warn / false)
+//!
+//! Gitattributes:
+//!   - `text` / `text=auto` / `-text` / `binary`
+//!   - `eol=lf` / `eol=crlf`
+//!   - `filter=<name>` (with `filter.<name>.clean` / `filter.<name>.smudge`)
+//!   - `ident` keyword expansion
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::attributes::{
+    attr_rule_matches as git_attr_rule_matches, collect_attrs_for_path,
+    parse_gitattributes_file_content, parse_gitattributes_file_content_with_base, AttrValue,
+    MacroTable, ParsedGitAttributes, MAX_ATTR_FILE_BYTES,
+};
+use crate::command_runner::{system_command_runner, CommandRunner, CommandSpec, CommandStdin};
+use crate::config::ConfigSet;
+use crate::error::{FilterError, FilterPhase};
+use crate::filter_process::{
+    apply_process_clean, apply_process_smudge, FilterProcessState, FilterSmudgeMeta,
+};
+use encoding_rs::UTF_8;
+
+/// Working-tree encoding conversion failure (Git `reencode_string_len` returning NULL).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WorkTreeEncodingError {
+    /// The encoding label is not supported by `encoding_rs` / the commit encoding helpers.
+    #[error("unsupported encoding '{label}'")]
+    UnsupportedEncoding {
+        /// Config or attribute encoding name.
+        label: String,
+    },
+}
+
+/// Error from internal encoding helpers (not public convert_to_git surface).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConversionError {
+    /// Working-tree encoding could not be resolved or converted.
+    #[error(transparent)]
+    Encoding(WorkTreeEncodingError),
+    /// Filter, safecrlf, BOM validation, or other conversion failure (Git-compatible message).
+    #[error("{0}")]
+    Message(String),
+}
+
+impl From<WorkTreeEncodingError> for ConversionError {
+    fn from(value: WorkTreeEncodingError) -> Self {
+        Self::Encoding(value)
+    }
+}
+
+impl From<String> for ConversionError {
+    fn from(value: String) -> Self {
+        Self::Message(value)
+    }
+}
+
+impl From<&str> for ConversionError {
+    fn from(value: &str) -> Self {
+        Self::Message(value.to_owned())
+    }
+}
+
+fn filter_detail(rel_path: &str, detail: String) -> FilterError {
+    FilterError::NotFilteredProperly {
+        path: rel_path.to_owned(),
+        detail,
+    }
+}
+
+fn external_filter_failed(rel_path: &str, driver: &str, phase: FilterPhase) -> FilterError {
+    FilterError::ExternalFilterFailed {
+        driver: driver.to_owned(),
+        path: rel_path.to_owned(),
+        phase,
+    }
+}
+
+/// What `core.autocrlf` is set to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoCrlf {
+    /// `True` variant.
+    True,
+    /// `Input` variant.
+    Input,
+    /// `False` variant.
+    False,
+}
+
+/// What `core.eol` is set to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreEol {
+    /// `Lf` variant.
+    Lf,
+    /// `Crlf` variant.
+    Crlf,
+    /// `Native` variant.
+    Native,
+}
+
+/// What `core.safecrlf` is set to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeCrlf {
+    /// `True` variant.
+    True,
+    /// `Warn` variant.
+    Warn,
+    /// `False` variant.
+    False,
+}
+
+/// Per-file text attribute from .gitattributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAttr {
+    /// `text` — always treat as text.
+    Set,
+    /// `text=auto` — auto-detect.
+    Auto,
+    /// `-text` or `binary` — never convert.
+    Unset,
+    /// No text attribute specified.
+    Unspecified,
+}
+
+/// Per-file eol attribute from .gitattributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EolAttr {
+    /// `Lf` variant.
+    Lf,
+    /// `Crlf` variant.
+    Crlf,
+    /// `Unspecified` variant.
+    Unspecified,
+}
+
+/// Legacy `crlf` gitattribute (deprecated in Git; still honored for EOL conversion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CrlfLegacyAttr {
+    #[default]
+    /// `Unspecified` variant.
+    Unspecified,
+    /// `-crlf` — disable CRLF conversion.
+    Unset,
+    /// `crlf=input` — normalize to LF in the object database; no CRLF on checkout.
+    Input,
+    /// Bare `crlf` (set) — force CRLF on checkout for text files.
+    Crlf,
+}
+
+/// Per-file merge attribute from .gitattributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeAttr {
+    /// No merge attribute specified.
+    Unspecified,
+    /// `-merge` — treat as binary/non-text merge.
+    Unset,
+    /// `merge=<driver>` — use named merge driver.
+    Driver(String),
+}
+
+/// How the `diff` gitattribute affects diff output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffAttr {
+    /// No `diff` attribute (use heuristics / default).
+    Unspecified,
+    /// `-diff` / `diff=unset` / `binary` — treat as binary for diff purposes.
+    Unset,
+    /// Bare `diff` (set) — force textual diff even when the blob contains NUL.
+    Set,
+    /// `diff=<driver>` — use named driver (e.g. for textconv).
+    Driver(String),
+}
+
+/// Per-file attributes relevant to conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAttrs {
+    /// `text` field.
+    pub text: TextAttr,
+    /// `eol` field.
+    pub eol: EolAttr,
+    /// Effect of the `diff` gitattribute on diff output.
+    pub diff_attr: DiffAttr,
+    /// `filter_clean` field.
+    pub filter_clean: Option<String>,
+    /// `filter_smudge` field.
+    pub filter_smudge: Option<String>,
+    /// `filter.<name>.process` — long-running filter (takes precedence over clean/smudge commands).
+    pub filter_process: Option<String>,
+    /// Driver name from the active `filter=<name>` gitattribute (for error messages).
+    pub filter_driver_name: Option<String>,
+    /// Whether `filter.<name>.required` is set for this path's filter driver.
+    pub filter_smudge_required: bool,
+    /// Same config key as smudge; clean direction fails when unset if true.
+    pub filter_clean_required: bool,
+    /// `ident` field.
+    pub ident: bool,
+    /// `merge` field.
+    pub merge: MergeAttr,
+    /// `conflict_marker_size` field.
+    pub conflict_marker_size: Option<String>,
+    /// Working tree encoding (e.g. "utf-16") — content is converted to UTF-8 on add.
+    pub working_tree_encoding: Option<String>,
+    /// Legacy `crlf` / `-crlf` / `crlf=input` from `.gitattributes`.
+    pub crlf_legacy: CrlfLegacyAttr,
+    /// `whitespace` attribute value: `None` if unset, `Some("set")` for bare `whitespace`,
+    /// `Some("unset")` for `-whitespace`, or `Some("trailing,...")` for `whitespace=...`.
+    pub whitespace: Option<String>,
+}
+
+impl Default for FileAttrs {
+    fn default() -> Self {
+        FileAttrs {
+            text: TextAttr::Unspecified,
+            eol: EolAttr::Unspecified,
+            diff_attr: DiffAttr::Unspecified,
+            filter_clean: None,
+            filter_smudge: None,
+            filter_process: None,
+            filter_driver_name: None,
+            filter_smudge_required: false,
+            filter_clean_required: false,
+            ident: false,
+            merge: MergeAttr::Unspecified,
+            conflict_marker_size: None,
+            working_tree_encoding: None,
+            crlf_legacy: CrlfLegacyAttr::Unspecified,
+            whitespace: None,
+        }
+    }
+}
+
+impl FileAttrs {
+    /// Width of conflict marker lines for this path (`conflict-marker-size` attribute).
+    ///
+    /// Matches Git: unset or invalid values default to 7; explicit `0` also maps to 7.
+    #[must_use]
+    pub(crate) fn effective_conflict_marker_size(&self) -> usize {
+        match self
+            .conflict_marker_size
+            .as_ref()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            None | Some(0) => 7,
+            Some(n) => n,
+        }
+    }
+}
+
+/// Global conversion settings derived from config.
+#[derive(Clone)]
+pub struct ConversionConfig {
+    /// `autocrlf` field.
+    pub autocrlf: AutoCrlf,
+    /// `eol` field.
+    pub eol: CoreEol,
+    /// `safecrlf` field.
+    pub safecrlf: SafeCrlf,
+    /// Subprocess runner for clean/smudge filters and iconv helpers.
+    pub command_runner: Arc<dyn CommandRunner>,
+}
+
+impl ConversionConfig {
+    /// Load conversion settings from a ConfigSet.
+    pub fn from_config(config: &ConfigSet) -> Self {
+        let autocrlf = match config.value("core.autocrlf") {
+            Some(v) => match v.to_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => AutoCrlf::True,
+                "input" => AutoCrlf::Input,
+                _ => AutoCrlf::False,
+            },
+            None => AutoCrlf::False,
+        };
+
+        let eol = match config.value("core.eol") {
+            Some(v) => match v.to_lowercase().as_str() {
+                "crlf" => CoreEol::Crlf,
+                "lf" => CoreEol::Lf,
+                "native" => CoreEol::Native,
+                _ => CoreEol::Native,
+            },
+            None => CoreEol::Native,
+        };
+
+        let safecrlf = match config.value("core.safecrlf") {
+            Some(v) => match v.to_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => SafeCrlf::True,
+                "warn" => SafeCrlf::Warn,
+                _ => SafeCrlf::False,
+            },
+            // Git warns on round-trip EOL issues by default when unset.
+            None => SafeCrlf::Warn,
+        };
+
+        ConversionConfig {
+            autocrlf,
+            eol,
+            safecrlf,
+            command_runner: system_command_runner(),
+        }
+    }
+
+    /// Like [`Self::from_config`] with an explicit filter/hook subprocess runner.
+    #[must_use]
+    pub fn from_config_with_runner(
+        config: &ConfigSet,
+        command_runner: Arc<dyn CommandRunner>,
+    ) -> Self {
+        let mut cfg = Self::from_config(config);
+        cfg.command_runner = command_runner;
+        cfg
+    }
+}
+
+impl std::fmt::Debug for ConversionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversionConfig")
+            .field("autocrlf", &self.autocrlf)
+            .field("eol", &self.eol)
+            .field("safecrlf", &self.safecrlf)
+            .field("command_runner", &"<CommandRunner>")
+            .finish()
+    }
+}
+
+pub use crate::attributes::AttrRule;
+
+fn merge_parsed_into(
+    merged: &mut ParsedGitAttributes,
+    mut parsed: ParsedGitAttributes,
+    take_macros: bool,
+) {
+    merged.rules.append(&mut parsed.rules);
+    if take_macros {
+        merged.macros.defs.extend(parsed.macros.defs.drain());
+    }
+    merged.warnings.append(&mut parsed.warnings);
+}
+
+fn merge_gitattributes_text(
+    merged: &mut ParsedGitAttributes,
+    content: &str,
+    display: &str,
+    attr_base: &str,
+) {
+    if content.len() > MAX_ATTR_FILE_BYTES {
+        return;
+    }
+    let parsed = if attr_base.is_empty() {
+        parse_gitattributes_file_content(content, display)
+    } else {
+        parse_gitattributes_file_content_with_base(content, display, attr_base)
+    };
+    merge_parsed_into(merged, parsed, attr_base.is_empty());
+}
+
+/// Load root and `info/attributes` gitattributes from the worktree.
+#[must_use]
+pub(crate) fn load_gitattributes_parsed(work_tree: &Path) -> ParsedGitAttributes {
+    let mut merged = ParsedGitAttributes::default();
+    let root_attrs = work_tree.join(".gitattributes");
+    if let Ok(content) = std::fs::read_to_string(&root_attrs) {
+        merge_gitattributes_text(&mut merged, &content, ".gitattributes", "");
+    }
+    let info_attrs = work_tree.join(".git/info/attributes");
+    if let Ok(content) = std::fs::read_to_string(&info_attrs) {
+        merge_gitattributes_text(&mut merged, &content, "info/attributes", "");
+    }
+    merged
+}
+
+/// Load .gitattributes from the worktree root.
+#[must_use]
+pub fn load_gitattributes(work_tree: &Path) -> Vec<AttrRule> {
+    load_gitattributes_parsed(work_tree).rules
+}
+
+/// Parse gitattributes content into attribute rules (repository root scope).
+///
+/// This is useful when attributes are sourced from non-worktree inputs
+/// (for example, tree objects selected by `--attr-source`).
+#[must_use]
+pub fn parse_gitattributes_content(content: &str) -> Vec<AttrRule> {
+    parse_gitattributes_file_content(content, ".gitattributes").rules
+}
+
+/// Load `.gitattributes` from the index (stage 0 paths only).
+#[must_use]
+pub fn load_gitattributes_from_index(
+    index: &crate::index::Index,
+    odb: &crate::odb::Odb,
+) -> Vec<AttrRule> {
+    crate::attributes::load_gitattributes_from_index(index, odb, Path::new("."))
+        .map(|p| p.rules)
+        .unwrap_or_default()
+}
+
+/// Load merged `.gitattributes` for `rel_path` (root, nested dirs, info; index fallback).
+#[must_use]
+pub(crate) fn load_gitattributes_for_checkout_parsed(
+    work_tree: &Path,
+    rel_path: &str,
+    index: &crate::index::Index,
+    odb: &crate::odb::Odb,
+) -> ParsedGitAttributes {
+    let mut merged = load_gitattributes_parsed(work_tree);
+
+    if !work_tree.join(".gitattributes").exists() {
+        if let Some(entry) = index.get(b".gitattributes", 0) {
+            if let Ok(obj) = odb.read(&entry.oid) {
+                if let Ok(content) = String::from_utf8(obj.data) {
+                    merge_gitattributes_text(&mut merged, &content, ".gitattributes", "");
+                }
+            }
+        }
+    }
+
+    let path = Path::new(rel_path);
+    if let Some(parent) = path.parent() {
+        let mut accum = PathBuf::new();
+        for comp in parent.components() {
+            accum.push(comp);
+            let ga_rel = accum.join(".gitattributes");
+            let ga_stored = ga_rel.to_string_lossy().replace('\\', "/");
+            let attr_base = Path::new(&ga_stored)
+                .parent()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let wt_ga = work_tree.join(&ga_rel);
+            if let Ok(content) = std::fs::read_to_string(&wt_ga) {
+                merge_gitattributes_text(&mut merged, &content, &ga_stored, &attr_base);
+            } else {
+                let key = crate::repo_relpath::storage_bytes(&ga_stored).into_owned();
+                if let Some(entry) = index.get(&key, 0) {
+                    if let Ok(obj) = odb.read(&entry.oid) {
+                        if let Ok(content) = String::from_utf8(obj.data) {
+                            merge_gitattributes_text(&mut merged, &content, &ga_stored, &attr_base);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    merged
+}
+
+/// Load `.gitattributes` rules that apply to `rel_path`, including root and
+/// nested `dir/.gitattributes` along parent directories (Git-consistent order:
+/// root first, then each ancestor directory; later rules win in `get_file_attrs`).
+///
+/// Reads from the working tree when present, otherwise from a stage-0 index entry.
+#[must_use]
+pub fn load_gitattributes_for_checkout(
+    work_tree: &Path,
+    rel_path: &str,
+    index: &crate::index::Index,
+    odb: &crate::odb::Odb,
+) -> Vec<AttrRule> {
+    load_gitattributes_for_checkout_parsed(work_tree, rel_path, index, odb).rules
+}
+
+fn config_bool_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
+}
+
+fn attr_path_for_match(rel_path: &str, is_dir: bool) -> String {
+    if is_dir && !rel_path.is_empty() && !rel_path.ends_with('/') {
+        format!("{rel_path}/")
+    } else {
+        rel_path.to_owned()
+    }
+}
+
+/// Map merged gitattributes (Git `collect_attrs`) to CRLF/filter [`FileAttrs`].
+#[must_use]
+pub(crate) fn file_attrs_from_attr_map(
+    map: &HashMap<String, AttrValue>,
+    config: &ConfigSet,
+) -> FileAttrs {
+    let mut fa = FileAttrs::default();
+    for (name, value) in map {
+        match name.as_str() {
+            "text" => {
+                fa.text = match value {
+                    AttrValue::Set => TextAttr::Set,
+                    AttrValue::Unset => TextAttr::Unset,
+                    AttrValue::Value(v) if v == "auto" => TextAttr::Auto,
+                    AttrValue::Clear | AttrValue::Value(_) => TextAttr::Unspecified,
+                };
+            }
+            "eol" => {
+                fa.eol = match value {
+                    AttrValue::Value(v) if v == "lf" => EolAttr::Lf,
+                    AttrValue::Value(v) if v == "crlf" => EolAttr::Crlf,
+                    _ => EolAttr::Unspecified,
+                };
+            }
+            "filter" => {
+                let driver = match value {
+                    AttrValue::Unset => {
+                        fa.filter_clean = None;
+                        fa.filter_smudge = None;
+                        fa.filter_process = None;
+                        fa.filter_driver_name = None;
+                        fa.filter_smudge_required = false;
+                        fa.filter_clean_required = false;
+                        continue;
+                    }
+                    AttrValue::Set => continue,
+                    AttrValue::Clear => continue,
+                    AttrValue::Value(d) => d.as_str(),
+                };
+                let clean_key = format!("filter.{driver}.clean");
+                let smudge_key = format!("filter.{driver}.smudge");
+                let process_key = format!("filter.{driver}.process");
+                let req_key = format!("filter.{driver}.required");
+                fa.filter_driver_name = Some(driver.to_owned());
+                fa.filter_process = config.value(&process_key).filter(|s| !s.is_empty());
+                if fa.filter_process.is_some() {
+                    fa.filter_clean = None;
+                    fa.filter_smudge = None;
+                } else {
+                    fa.filter_clean = config.value(&clean_key);
+                    fa.filter_smudge = config.value(&smudge_key);
+                }
+                let required = config
+                    .value(&req_key)
+                    .is_some_and(|v| config_bool_truthy(v.as_str()));
+                fa.filter_smudge_required = required;
+                fa.filter_clean_required = required;
+            }
+            "diff" => {
+                fa.diff_attr = match value {
+                    AttrValue::Unset => DiffAttr::Unset,
+                    AttrValue::Set => DiffAttr::Set,
+                    AttrValue::Value(v) if !v.is_empty() => DiffAttr::Driver(v.clone()),
+                    AttrValue::Clear => DiffAttr::Unspecified,
+                    _ => DiffAttr::Unspecified,
+                };
+            }
+            "ident" => {
+                fa.ident = matches!(value, AttrValue::Set);
+            }
+            "merge" => {
+                fa.merge = match value {
+                    AttrValue::Unset => MergeAttr::Unset,
+                    AttrValue::Set => MergeAttr::Unspecified,
+                    AttrValue::Value(v) => MergeAttr::Driver(v.clone()),
+                    AttrValue::Clear => MergeAttr::Unspecified,
+                };
+            }
+            "conflict-marker-size" => match value {
+                AttrValue::Unset | AttrValue::Clear => fa.conflict_marker_size = None,
+                AttrValue::Value(v) => fa.conflict_marker_size = Some(v.clone()),
+                AttrValue::Set => {}
+            },
+            "working-tree-encoding" => {
+                if let AttrValue::Value(v) = value {
+                    if !v.is_empty() {
+                        fa.working_tree_encoding = Some(v.clone());
+                    }
+                }
+            }
+            "crlf" => {
+                fa.crlf_legacy = match value {
+                    AttrValue::Unset => CrlfLegacyAttr::Unset,
+                    AttrValue::Value(v) if v == "input" => CrlfLegacyAttr::Input,
+                    AttrValue::Set => CrlfLegacyAttr::Crlf,
+                    AttrValue::Value(v) if v == "true" || v == "set" => CrlfLegacyAttr::Crlf,
+                    _ => CrlfLegacyAttr::Unspecified,
+                };
+            }
+            "whitespace" => match value {
+                AttrValue::Unset => fa.whitespace = Some("unset".to_owned()),
+                AttrValue::Set => fa.whitespace = Some("set".to_owned()),
+                AttrValue::Value(v) if !v.is_empty() => fa.whitespace = Some(v.clone()),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    fa
+}
+
+/// Resolve [`FileAttrs`] using Git-compatible attribute matching and macro expansion.
+#[must_use]
+pub(crate) fn file_attrs_from_gitattributes(
+    rules: &[AttrRule],
+    macros: &MacroTable,
+    rel_path: &str,
+    is_dir: bool,
+    config: &ConfigSet,
+) -> FileAttrs {
+    let path = attr_path_for_match(rel_path, is_dir);
+    let map = collect_attrs_for_path(rules, macros, &path, config.ignore_case());
+    file_attrs_from_attr_map(&map, config)
+}
+
+/// Get file attributes for a given path from .gitattributes rules and config.
+///
+/// `is_dir` should be true when `rel_path` names a directory (Git passes a trailing `/` for
+/// directory paths in some call sites; we accept either trailing `/` or this flag from tree walks).
+#[must_use]
+pub(crate) fn get_file_attrs(
+    rules: &[AttrRule],
+    rel_path: &str,
+    is_dir: bool,
+    config: &ConfigSet,
+) -> FileAttrs {
+    file_attrs_from_gitattributes(rules, &MacroTable::default(), rel_path, is_dir, config)
+}
+
+/// Every attribute assigned to `path` after macro expansion, with `icase` selecting
+/// case-insensitive pattern matching (`core.ignorecase`).
+pub(crate) fn path_gitattribute_values(
+    rules: &[AttrRule],
+    macros: &MacroTable,
+    icase: bool,
+    path: &str,
+    is_dir: bool,
+) -> std::collections::HashMap<String, crate::attributes::AttrValue> {
+    collect_attrs_for_path(rules, macros, &attr_path_for_match(path, is_dir), icase)
+}
+
+/// Whether `rule` matches `rel_path` given directory vs file context (Git `path_matches`).
+#[must_use]
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn attr_rule_matches(rule: &AttrRule, rel_path: &str, is_dir: bool) -> bool {
+    let match_path = attr_path_for_match(rel_path, is_dir);
+    git_attr_rule_matches(rule, &match_path, false)
+}
+
+/// Returns true if the data looks binary (contains NUL bytes in the first 8000 bytes).
+pub fn is_binary(data: &[u8]) -> bool {
+    let check_len = data.len().min(8000);
+    data[..check_len].contains(&0)
+}
+
+// Git `convert.c` `CONVERT_STAT_BITS_*` / `gather_convert_stats_ascii` (for `ls-files --eol`).
+const CONVERT_STAT_BITS_TXT_LF: u32 = 0x1;
+const CONVERT_STAT_BITS_TXT_CRLF: u32 = 0x2;
+const CONVERT_STAT_BITS_BIN: u32 = 0x4;
+
+#[derive(Default, Clone)]
+struct TextStat {
+    nul: u32,
+    lonecr: u32,
+    lonelf: u32,
+    crlf: u32,
+    printable: u32,
+    nonprintable: u32,
+}
+
+fn gather_text_stat(data: &[u8]) -> TextStat {
+    let mut s = TextStat::default();
+    let mut i = 0usize;
+    while i < data.len() {
+        let c = data[i];
+        if c == b'\r' {
+            if i + 1 < data.len() && data[i + 1] == b'\n' {
+                s.crlf += 1;
+                i += 2;
+            } else {
+                s.lonecr += 1;
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'\n' {
+            s.lonelf += 1;
+            i += 1;
+            continue;
+        }
+        if c == 127 {
+            s.nonprintable += 1;
+        } else if c < 32 {
+            match c {
+                b'\t' | b'\x08' | b'\x1b' | b'\x0c' => s.printable += 1,
+                0 => {
+                    s.nul += 1;
+                    s.nonprintable += 1;
+                }
+                _ => s.nonprintable += 1,
+            }
+        } else {
+            s.printable += 1;
+        }
+        i += 1;
+    }
+    s
+}
+
+fn convert_is_binary(stats: &TextStat) -> bool {
+    stats.lonecr > 0 || stats.nul > 0 || (stats.printable >> 7) < stats.nonprintable
+}
+
+fn git_text_stat(data: &[u8]) -> TextStat {
+    let mut stats = gather_text_stat(data);
+    if !data.is_empty() && data[data.len() - 1] == 0x1a {
+        stats.nonprintable = stats.nonprintable.saturating_sub(1);
+    }
+    stats
+}
+
+/// Git `will_convert_lf_to_crlf` using [`TextStat`] (same rules as [`should_convert_to_crlf`] on bytes).
+fn will_convert_lf_to_crlf_from_stats(
+    stats: &TextStat,
+    conv: &ConversionConfig,
+    attrs: &FileAttrs,
+) -> bool {
+    let has_lone_lf = stats.lonelf > 0;
+    let is_bin = convert_is_binary(stats);
+
+    match attrs.crlf_legacy {
+        CrlfLegacyAttr::Unset | CrlfLegacyAttr::Input => return false,
+        CrlfLegacyAttr::Crlf => {
+            if attrs.text == TextAttr::Unset {
+                return false;
+            }
+            return has_lone_lf;
+        }
+        CrlfLegacyAttr::Unspecified => {}
+    }
+
+    if attrs.text == TextAttr::Unset {
+        return false;
+    }
+
+    if attrs.eol != EolAttr::Unspecified {
+        if attrs.text == TextAttr::Auto && is_bin {
+            return false;
+        }
+        if attrs.eol != EolAttr::Crlf {
+            return false;
+        }
+        if attrs.text == TextAttr::Auto {
+            return auto_crlf_should_smudge_lf_to_crlf_from_stats(stats);
+        }
+        return has_lone_lf;
+    }
+
+    if attrs.text == TextAttr::Set {
+        if !output_eol_is_crlf(conv) {
+            return false;
+        }
+        return has_lone_lf;
+    }
+
+    if attrs.text == TextAttr::Auto {
+        if is_bin || !output_eol_is_crlf(conv) {
+            return false;
+        }
+        return auto_crlf_should_smudge_lf_to_crlf_from_stats(stats);
+    }
+
+    match conv.autocrlf {
+        AutoCrlf::True => {
+            if is_bin {
+                return false;
+            }
+            auto_crlf_should_smudge_lf_to_crlf_from_stats(stats)
+        }
+        AutoCrlf::Input | AutoCrlf::False => false,
+    }
+}
+
+fn auto_crlf_should_smudge_lf_to_crlf_from_stats(stats: &TextStat) -> bool {
+    if stats.lonelf == 0 {
+        return false;
+    }
+    if stats.lonecr > 0 || stats.crlf > 0 {
+        return false;
+    }
+    !convert_is_binary(stats)
+}
+
+fn gather_convert_stats(data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return 0;
+    }
+    let mut stats = gather_text_stat(data);
+    if !data.is_empty() && data[data.len() - 1] == 0x1a {
+        stats.nonprintable = stats.nonprintable.saturating_sub(1);
+    }
+    let mut ret = 0u32;
+    if convert_is_binary(&stats) {
+        ret |= CONVERT_STAT_BITS_BIN;
+    }
+    if stats.crlf > 0 {
+        ret |= CONVERT_STAT_BITS_TXT_CRLF;
+    }
+    if stats.lonelf > 0 {
+        ret |= CONVERT_STAT_BITS_TXT_LF;
+    }
+    ret
+}
+
+/// Git `convert.c` `gather_convert_stats_ascii` — worktree/index blob EOL stats for `ls-files --eol`.
+#[must_use]
+pub fn gather_convert_stats_ascii(data: &[u8]) -> &'static str {
+    let convert_stats = gather_convert_stats(data);
+    if convert_stats & CONVERT_STAT_BITS_BIN != 0 {
+        return "-text";
+    }
+    match convert_stats {
+        CONVERT_STAT_BITS_TXT_LF => "lf",
+        CONVERT_STAT_BITS_TXT_CRLF => "crlf",
+        x if x == (CONVERT_STAT_BITS_TXT_LF | CONVERT_STAT_BITS_TXT_CRLF) => "mixed",
+        _ => "none",
+    }
+}
+
+/// Returns true if data contains any CRLF sequences.
+pub fn has_crlf(data: &[u8]) -> bool {
+    data.windows(2).any(|w| w == b"\r\n")
+}
+
+/// Returns true if data contains any lone LF (not preceded by CR).
+pub fn has_lone_lf(data: &[u8]) -> bool {
+    for i in 0..data.len() {
+        if data[i] == b'\n' && (i == 0 || data[i - 1] != b'\r') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if data contains a bare CR not followed by LF (Git `text_stat.lonecr`).
+fn has_lone_cr(data: &[u8]) -> bool {
+    for i in 0..data.len() {
+        if data[i] == b'\r' && (i + 1 >= data.len() || data[i + 1] != b'\n') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Git `convert.c` `will_convert_lf_to_crlf` for `CRLF_AUTO` / `CRLF_AUTO_INPUT` / `CRLF_AUTO_CRLF`:
+/// if the blob already has CRLF pairs or lone CRs, do not convert lone LFs to CRLF on checkout.
+fn auto_crlf_should_smudge_lf_to_crlf(data: &[u8]) -> bool {
+    if !has_lone_lf(data) {
+        return false;
+    }
+    if has_lone_cr(data) || has_crlf(data) {
+        return false;
+    }
+    if is_binary(data) {
+        return false;
+    }
+    true
+}
+
+/// Returns true if ALL line endings are CRLF (no lone LF).
+pub fn is_all_crlf(data: &[u8]) -> bool {
+    has_crlf(data) && !has_lone_lf(data)
+}
+
+/// Returns true if ALL line endings are LF (no CRLF).
+pub fn is_all_lf(data: &[u8]) -> bool {
+    has_lone_lf(data) && !has_crlf(data)
+}
+
+/// Git `convert.c` `has_crlf_in_index`: index blob already contains CRLF pairs (non-binary).
+#[must_use]
+pub fn has_crlf_in_index_blob(data: &[u8]) -> bool {
+    if !data.contains(&b'\r') {
+        return false;
+    }
+    let st = gather_convert_stats(data);
+    st & CONVERT_STAT_BITS_BIN == 0 && (st & CONVERT_STAT_BITS_TXT_CRLF) != 0
+}
+
+/// Whether clean conversion uses Git's `has_crlf_in_index` guard (`convert.c` only for
+/// `CRLF_AUTO`, `CRLF_AUTO_INPUT`, `CRLF_AUTO_CRLF`). Bare `eol=` without `text=auto` becomes
+/// `CRLF_TEXT_*` and must not use this guard.
+#[must_use]
+pub fn clean_uses_autocrlf_index_guard(attrs: &FileAttrs, conv: &ConversionConfig) -> bool {
+    if attrs.text == TextAttr::Unset || attrs.crlf_legacy == CrlfLegacyAttr::Unset {
+        return false;
+    }
+    if attrs.eol != EolAttr::Unspecified && attrs.text != TextAttr::Auto {
+        return false;
+    }
+    attrs.text == TextAttr::Auto
+        || (attrs.text == TextAttr::Unspecified
+            && matches!(conv.autocrlf, AutoCrlf::True | AutoCrlf::Input))
+}
+
+/// Optional inputs for `convert_to_git_with_opts` (Git `CONV_EOL_RENORMALIZE` / index blob).
+#[derive(Clone, Copy)]
+pub struct ConvertToGitOpts<'a> {
+    /// Stage-0 blob bytes for this path before the current add (for safer-autocrlf).
+    pub index_blob: Option<&'a [u8]>,
+    /// When true, always apply CRLF→LF when configured (merge/cherry-pick renormalize).
+    pub renormalize: bool,
+    /// When false, skip `core.safecrlf` simulation (used for internal diff/hashing — must not spam stderr).
+    pub check_safecrlf: bool,
+    /// Long-running filter registry for this repository handle.
+    pub filter_process: Option<&'a FilterProcessState>,
+    /// Subprocess runner for clean/smudge shell filters (defaults to the conversion config runner).
+    pub command_runner: Option<&'a dyn CommandRunner>,
+}
+
+impl Default for ConvertToGitOpts<'_> {
+    fn default() -> Self {
+        Self {
+            index_blob: None,
+            renormalize: false,
+            check_safecrlf: true,
+            filter_process: None,
+            command_runner: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ConvertToGitOpts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConvertToGitOpts")
+            .field("index_blob", &self.index_blob.map(|b| b.len()))
+            .field("renormalize", &self.renormalize)
+            .field("check_safecrlf", &self.check_safecrlf)
+            .field("command_runner", &self.command_runner.is_some())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// working-tree-encoding (Git `convert.c` `encode_to_git` / `encode_to_worktree`)
+// ---------------------------------------------------------------------------
+
+// BOM byte sequences (Git `utf8.c`).
+const UTF16_BE_BOM: &[u8] = &[0xFE, 0xFF];
+const UTF16_LE_BOM: &[u8] = &[0xFF, 0xFE];
+const UTF32_BE_BOM: &[u8] = &[0x00, 0x00, 0xFE, 0xFF];
+const UTF32_LE_BOM: &[u8] = &[0xFF, 0xFE, 0x00, 0x00];
+
+/// Canonical lowercase UTF label for a `working-tree-encoding` value, or `None` if the label is
+/// not a UTF-16/UTF-32/UTF-8 variant Git treats specially. Mirrors Git's `same_utf_encoding`
+/// (strip a leading `utf` then an optional `-`, case-insensitive), so `utf16`, `UTF-16`,
+/// `Utf16Le-Bom` all normalize.
+fn canonical_utf_label(label: &str) -> Option<String> {
+    let trimmed = label.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("utf")?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    match rest {
+        "8" => Some("utf-8".to_string()),
+        "16" => Some("utf-16".to_string()),
+        "16be" => Some("utf-16be".to_string()),
+        "16le" => Some("utf-16le".to_string()),
+        "16be-bom" => Some("utf-16be-bom".to_string()),
+        "16le-bom" => Some("utf-16le-bom".to_string()),
+        "32" => Some("utf-32".to_string()),
+        "32be" => Some("utf-32be".to_string()),
+        "32le" => Some("utf-32le".to_string()),
+        _ => None,
+    }
+}
+
+fn has_bom_prefix(data: &[u8], bom: &[u8]) -> bool {
+    data.len() >= bom.len() && &data[..bom.len()] == bom
+}
+
+/// Git `has_prohibited_utf_bom`: UTF-16BE/LE and UTF-32BE/LE must not begin with a BOM.
+fn has_prohibited_utf_bom(canon: &str, data: &[u8]) -> bool {
+    match canon {
+        "utf-16be" | "utf-16le" => {
+            has_bom_prefix(data, UTF16_BE_BOM) || has_bom_prefix(data, UTF16_LE_BOM)
+        }
+        "utf-32be" | "utf-32le" => {
+            has_bom_prefix(data, UTF32_BE_BOM) || has_bom_prefix(data, UTF32_LE_BOM)
+        }
+        _ => false,
+    }
+}
+
+/// Git `is_missing_required_utf_bom`: bare UTF-16 / UTF-32 must begin with a BOM.
+fn is_missing_required_utf_bom(canon: &str, data: &[u8]) -> bool {
+    match canon {
+        "utf-16" => !(has_bom_prefix(data, UTF16_BE_BOM) || has_bom_prefix(data, UTF16_LE_BOM)),
+        "utf-32" => !(has_bom_prefix(data, UTF32_BE_BOM) || has_bom_prefix(data, UTF32_LE_BOM)),
+        _ => false,
+    }
+}
+
+/// Git `validate_encoding`: emit the advice line to stderr and return an error body when the BOM
+/// presence is wrong for a UTF-16/UTF-32 encoding.
+///
+/// `label` is the original attribute spelling (preserved in messages, like Git). When
+/// `die_on_error` is true (`CONV_WRITE_OBJECT`) the body is prefixed `fatal:` so the top-level
+/// printer surfaces it verbatim; otherwise the `error:` line is printed here (Git `error()` returns
+/// "content unmodified") and the same body is returned for the caller to swallow.
+fn validate_utf_bom(
+    canon: &str,
+    label: &str,
+    rel_path: &str,
+    data: &[u8],
+    die_on_error: bool,
+) -> Result<(), String> {
+    if has_prohibited_utf_bom(canon, data) {
+        // Advice cuts the trailing "be"/"le" so the user sees the BOM-capable name (UTF-16/UTF-32).
+        let stripped = label
+            .strip_prefix("utf")
+            .or_else(|| label.strip_prefix("UTF"));
+        let _utf_num = stripped
+            .map(|s| s.trim_start_matches('-'))
+            .and_then(|s| s.get(..s.len().saturating_sub(2)))
+            .unwrap_or("");
+        let body = format!("BOM is prohibited in '{rel_path}' if encoded as {label}");
+        if die_on_error {
+            return Err(body);
+        }
+        return Err(body);
+    }
+    if is_missing_required_utf_bom(canon, data) {
+        let _utf_num = label
+            .strip_prefix("utf")
+            .or_else(|| label.strip_prefix("UTF"))
+            .map(|s| s.trim_start_matches('-'))
+            .unwrap_or("");
+        let body = format!("BOM is required in '{rel_path}' if encoded as {label}");
+        if die_on_error {
+            return Err(body);
+        }
+        return Err(body);
+    }
+    Ok(())
+}
+
+/// Decode raw working-tree bytes (`enc_label`) into UTF-8 for the object DB (Git `encode_to_git`).
+///
+/// When `validate` is true (writing to the object DB), enforce Git's UTF BOM rules and surface the
+/// matching fatal message + advice (`die_on_error`). For internal diff/status reads it is false.
+fn decode_working_tree_bytes_to_utf8(
+    src: &[u8],
+    rel_path: &str,
+    enc_label: &str,
+    validate: bool,
+) -> Result<Vec<u8>, ConversionError> {
+    let label = enc_label.trim();
+    if label.is_empty() {
+        return Ok(src.to_vec());
+    }
+
+    let canon = canonical_utf_label(label);
+
+    // BOM validation (only the UTF-16/UTF-32 family). Git validates on every `encode_to_git`; when
+    // writing to the object DB it dies, otherwise (diff/status reads) it prints `error:` and treats
+    // the content as unmodified — `validate` here is Git's `die_on_error` (`CONV_WRITE_OBJECT`).
+    if let Some(ref c) = canon {
+        validate_utf_bom(c, label, rel_path, src, validate)?;
+    }
+
+    // UTF-8 is the default encoding: no conversion (Git `git_path_check_encoding`).
+    if canon.as_deref() == Some("utf-8") {
+        return Ok(src.to_vec());
+    }
+
+    // The `*-BOM` aliases decode like the matching raw encoding once the BOM is stripped.
+    let (iconv_from, body): (&str, &[u8]) = match canon.as_deref() {
+        Some("utf-16le-bom") => {
+            let body = if has_bom_prefix(src, UTF16_LE_BOM) {
+                &src[2..]
+            } else {
+                src
+            };
+            ("UTF-16LE", body)
+        }
+        Some("utf-16be-bom") => {
+            let body = if has_bom_prefix(src, UTF16_BE_BOM) {
+                &src[2..]
+            } else {
+                src
+            };
+            ("UTF-16BE", body)
+        }
+        // Bare UTF-16/UTF-32 keep their BOM; iconv consumes it to pick the byte order.
+        Some(c) => (utf_canon_to_iconv_name(c), src),
+        None => {
+            if crate::commit_encoding::is_iso_8859_1(label) {
+                return Ok(crate::commit_encoding::worktree_latin1_to_utf8_bytes(src));
+            }
+            // Unknown / unsupported label (Git `reencode_string_len` returns NULL →
+            // `failed to encode '%s' from %s to %s`).
+            let Some(enc) = crate::commit_encoding::resolve(label) else {
+                return Err(WorkTreeEncodingError::UnsupportedEncoding {
+                    label: label.to_owned(),
+                }
+                .into());
+            };
+            if enc == UTF_8 {
+                return Ok(src.to_vec());
+            }
+            let (cow, _, had_errors) = enc.decode(src);
+            if had_errors {
+                return Err(ConversionError::Message(format!(
+                    "failed to encode '{rel_path}' from {label} to UTF-8"
+                )));
+            }
+            return Ok(cow.into_owned().into_bytes());
+        }
+    };
+
+    decode_utf_bytes_with_encoding_rs(body, rel_path, label, iconv_from)
+}
+
+/// Decode UTF-16/UTF-32 family bytes to UTF-8 (`encoding_rs` or manual UTF-32).
+fn decode_utf_bytes_with_encoding_rs(
+    body: &[u8],
+    rel_path: &str,
+    label: &str,
+    iconv_from: &str,
+) -> Result<Vec<u8>, ConversionError> {
+    let fail = || {
+        ConversionError::Message(format!(
+            "failed to encode '{rel_path}' from {label} to UTF-8"
+        ))
+    };
+    match iconv_from {
+        "UTF-16BE" => {
+            let (cow, _, had_errors) = encoding_rs::UTF_16BE.decode(body);
+            if had_errors {
+                return Err(fail());
+            }
+            Ok(cow.into_owned().into_bytes())
+        }
+        "UTF-16LE" => {
+            let (cow, _, had_errors) = encoding_rs::UTF_16LE.decode(body);
+            if had_errors {
+                return Err(fail());
+            }
+            Ok(cow.into_owned().into_bytes())
+        }
+        "UTF-16" => {
+            if has_bom_prefix(body, UTF16_BE_BOM) {
+                decode_utf_bytes_with_encoding_rs(&body[2..], rel_path, label, "UTF-16BE")
+            } else if has_bom_prefix(body, UTF16_LE_BOM) {
+                decode_utf_bytes_with_encoding_rs(&body[2..], rel_path, label, "UTF-16LE")
+            } else {
+                Err(fail())
+            }
+        }
+        "UTF-32" => {
+            if has_bom_prefix(body, UTF32_BE_BOM) {
+                decode_utf32_body_to_utf8_bytes(&body[4..], rel_path, true)
+            } else if has_bom_prefix(body, UTF32_LE_BOM) {
+                decode_utf32_body_to_utf8_bytes(&body[4..], rel_path, false)
+            } else {
+                Err(fail())
+            }
+        }
+        "UTF-32BE" => decode_utf32_body_to_utf8_bytes(body, rel_path, true),
+        "UTF-32LE" => decode_utf32_body_to_utf8_bytes(body, rel_path, false),
+        _ => Err(fail()),
+    }
+}
+
+fn decode_utf32_body_to_utf8_bytes(
+    body: &[u8],
+    rel_path: &str,
+    big_endian: bool,
+) -> Result<Vec<u8>, ConversionError> {
+    let fail = || {
+        ConversionError::Message(format!(
+            "failed to encode '{rel_path}' from UTF-32 to UTF-8"
+        ))
+    };
+    if !body.len().is_multiple_of(4) {
+        return Err(fail());
+    }
+    let mut s = String::new();
+    for chunk in body.as_chunks::<4>().0 {
+        let cp = if big_endian {
+            u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+        } else {
+            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+        };
+        let Some(ch) = char::from_u32(cp) else {
+            return Err(fail());
+        };
+        s.push(ch);
+    }
+    Ok(s.into_bytes())
+}
+
+/// iconv encoding name for a canonical UTF label (raw encodings only; `*-bom` handled separately).
+fn utf_canon_to_iconv_name(canon: &str) -> &'static str {
+    match canon {
+        "utf-16" => "UTF-16",
+        "utf-16be" => "UTF-16BE",
+        "utf-16le" => "UTF-16LE",
+        "utf-32" => "UTF-32",
+        "utf-32be" => "UTF-32BE",
+        "utf-32le" => "UTF-32LE",
+        _ => "UTF-8",
+    }
+}
+
+/// Encode a UTF-8 blob into raw working-tree bytes for `enc_label` (Git `encode_to_worktree`).
+///
+/// Bare `UTF-16`/`UTF-32` and the `*-BOM` aliases get a BOM (Git relies on libiconv / explicit
+/// BOM handling); the raw `UTF-16BE`/`UTF-16LE`/`UTF-32BE`/`UTF-32LE` encodings produce no BOM.
+fn encode_utf8_blob_to_working_tree_bytes(
+    src: &[u8],
+    rel_path: &str,
+    enc_label: &str,
+) -> Result<Vec<u8>, ConversionError> {
+    let label = enc_label.trim();
+    if label.is_empty() {
+        return Ok(src.to_vec());
+    }
+
+    let canon = canonical_utf_label(label);
+    if canon.as_deref() == Some("utf-8") {
+        return Ok(src.to_vec());
+    }
+
+    let fail = || {
+        ConversionError::Message(format!(
+            "failed to encode '{rel_path}' from UTF-8 to {label}"
+        ))
+    };
+
+    // The `*-BOM` aliases: encode to the raw form, then prepend the requested BOM.
+    match canon.as_deref() {
+        Some("utf-16le-bom") => {
+            let body = encode_utf_with_encoding_rs(src, "utf-16le").ok_or_else(fail)?;
+            let mut out = UTF16_LE_BOM.to_vec();
+            out.extend(body);
+            return Ok(out);
+        }
+        Some("utf-16be-bom") => {
+            let body = encode_utf_with_encoding_rs(src, "utf-16be").ok_or_else(fail)?;
+            let mut out = UTF16_BE_BOM.to_vec();
+            out.extend(body);
+            return Ok(out);
+        }
+        // Bare UTF-16/UTF-32: Git/libiconv emits a BOM then little-endian code units (see `iconv`).
+        Some("utf-16") => {
+            let body = encode_utf_with_encoding_rs(src, "utf-16le").ok_or_else(fail)?;
+            let mut out = UTF16_LE_BOM.to_vec();
+            out.extend(body);
+            return Ok(out);
+        }
+        Some("utf-32") => {
+            let body = encode_utf_with_encoding_rs(src, "utf-32le").ok_or_else(fail)?;
+            let mut out = UTF32_LE_BOM.to_vec();
+            out.extend(body);
+            return Ok(out);
+        }
+        Some(c) => {
+            return encode_utf_with_encoding_rs(src, c).ok_or_else(fail);
+        }
+        None => {}
+    }
+
+    if crate::commit_encoding::is_iso_8859_1(label) {
+        return crate::commit_encoding::utf8_bytes_to_worktree_latin1(src).ok_or_else(fail);
+    }
+
+    let s = std::str::from_utf8(src).map_err(|_| fail())?;
+    let Some(enc) = crate::commit_encoding::resolve(label) else {
+        return Err(WorkTreeEncodingError::UnsupportedEncoding {
+            label: label.to_owned(),
+        }
+        .into());
+    };
+    if enc == UTF_8 {
+        return Ok(src.to_vec());
+    }
+    let (cow, _, had_errors) = enc.encode(s);
+    if had_errors {
+        return Err(fail());
+    }
+    Ok(cow.into_owned())
+}
+
+/// UTF encode via `encoding_rs`/manual UTF-32. `target` is a canonical label (`utf-16le` etc.).
+/// Produces raw bytes (no BOM).
+fn encode_utf_with_encoding_rs(src: &[u8], target: &str) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(src).ok()?;
+    let lower = target.to_ascii_lowercase();
+    let mut out = Vec::new();
+    match lower.as_str() {
+        "utf-16" | "utf-16be" => {
+            for u in s.encode_utf16() {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
+        }
+        "utf-16le" => {
+            for u in s.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        "utf-32" | "utf-32be" => {
+            for ch in s.chars() {
+                out.extend_from_slice(&(ch as u32).to_be_bytes());
+            }
+        }
+        "utf-32le" => {
+            for ch in s.chars() {
+                out.extend_from_slice(&(ch as u32).to_le_bytes());
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Input (add / clean) direction
+// ---------------------------------------------------------------------------
+
+/// Convert data for storage in the index/object database (the "clean" direction).
+///
+/// This handles:
+/// 1. Clean filter execution
+/// 2. `working-tree-encoding` decode to UTF-8
+/// 3. CRLF → LF conversion based on config + attributes
+/// 4. `$Id: … $` → `$Id$` collapse when `ident` is set
+/// 5. safecrlf checking
+///
+/// Returns `Ok(data)` on success, or an error if safecrlf rejects it.
+pub fn convert_to_git(
+    data: &[u8],
+    rel_path: &str,
+    conv: &ConversionConfig,
+    file_attrs: &FileAttrs,
+) -> Result<Vec<u8>, FilterError> {
+    convert_to_git_with_opts(
+        data,
+        rel_path,
+        conv,
+        file_attrs,
+        ConvertToGitOpts::default(),
+    )
+}
+
+/// Like [`convert_to_git`] with Git-compatible safer-autocrlf index handling.
+pub(crate) fn convert_to_git_with_opts(
+    data: &[u8],
+    rel_path: &str,
+    conv: &ConversionConfig,
+    file_attrs: &FileAttrs,
+    opts: ConvertToGitOpts<'_>,
+) -> Result<Vec<u8>, FilterError> {
+    convert_to_git_owned(data.to_vec(), rel_path, conv, file_attrs, opts)
+}
+
+/// [`convert_to_git_with_opts`] taking ownership of `data`, so content that needs no
+/// conversion is returned without a copy.
+pub(crate) fn convert_to_git_owned(
+    data: Vec<u8>,
+    rel_path: &str,
+    conv: &ConversionConfig,
+    file_attrs: &FileAttrs,
+    opts: ConvertToGitOpts<'_>,
+) -> Result<Vec<u8>, FilterError> {
+    let mut buf = data;
+    let owned_filter_state;
+    let filter_state = if let Some(s) = opts.filter_process {
+        s
+    } else {
+        owned_filter_state = FilterProcessState::new(Arc::clone(&conv.command_runner));
+        &owned_filter_state
+    };
+    let runner = opts.command_runner.unwrap_or(conv.command_runner.as_ref());
+
+    // 1. Run clean filter if configured (long-running `process` overrides clean command)
+    if let Some(ref proc_cmd) = file_attrs.filter_process {
+        let name = file_attrs.filter_driver_name.as_deref().unwrap_or_default();
+        if file_attrs.filter_clean_required {
+            start_required_process_filter(
+                filter_state,
+                proc_cmd,
+                name,
+                rel_path,
+                FilterPhase::Clean,
+            )?;
+        }
+        match apply_process_clean(filter_state, proc_cmd, rel_path, &buf) {
+            Ok(filtered) => buf = filtered,
+            Err(e) => {
+                if file_attrs.filter_clean_required {
+                    if e.contains("expected git-filter-server") {
+                        return Err(filter_detail(rel_path, e));
+                    }
+                    return Err(FilterError::ExternalFilterFailed {
+                        driver: name.to_owned(),
+                        path: rel_path.to_owned(),
+                        phase: FilterPhase::Clean,
+                    });
+                }
+                if e.starts_with("filter status: abort") {
+                    filter_state.disable_process_filter(proc_cmd);
+                }
+            }
+        }
+    } else {
+        match file_attrs.filter_clean.as_ref() {
+            Some(clean_cmd) => {
+                match run_filter_command(runner, clean_cmd, &buf, rel_path, Some(filter_state)) {
+                    Ok(filtered) => buf = filtered,
+                    Err(e) if file_attrs.filter_clean_required => {
+                        let name = file_attrs.filter_driver_name.as_deref().unwrap_or_default();
+                        return Err(e.into_required_error(name, rel_path, FilterPhase::Clean));
+                    }
+                    // Like Git, an optional filter that fails leaves the content unfiltered.
+                    Err(_) => {}
+                }
+            }
+            None => {
+                if file_attrs.filter_clean_required {
+                    let name = file_attrs.filter_driver_name.as_deref().unwrap_or_default();
+                    return Err(FilterError::ExternalFilterFailed {
+                        driver: name.to_owned(),
+                        path: rel_path.to_owned(),
+                        phase: FilterPhase::Clean,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. working-tree-encoding: working tree bytes → UTF-8 for the object DB (Git `encode_to_git`).
+    if let Some(ref enc) = file_attrs.working_tree_encoding {
+        // Bare `working-tree-encoding` (boolean true) / `false` are rejected (Git
+        // `git_path_check_encoding`).
+        if enc == "set" || enc == "true" || enc == "false" {
+            return Err(FilterError::InvalidWorkingTreeEncoding);
+        }
+        // `CONV_WRITE_OBJECT` → validate BOM rules and die on error (Git `encode_to_git`).
+        let writing_object = opts.check_safecrlf;
+        match decode_working_tree_bytes_to_utf8(&buf, rel_path, enc, writing_object) {
+            Ok(decoded) => buf = decoded,
+            Err(e) if writing_object => return Err(filter_detail(rel_path, e.to_string())),
+            // Reads for diff/status/hashing keep the bytes as they are when they cannot be
+            // re-encoded, as Git does without `CONV_WRITE_OBJECT`.
+            Err(_) => {}
+        }
+    }
+
+    // 3. Determine if we should do CRLF→LF conversion
+    let would_convert = would_convert_on_input(conv, file_attrs, &buf);
+
+    let mut convert_crlf_into_lf = would_convert && has_crlf(&buf);
+    if convert_crlf_into_lf
+        && clean_uses_autocrlf_index_guard(file_attrs, conv)
+        && !opts.renormalize
+        && opts.index_blob.is_some_and(has_crlf_in_index_blob)
+    {
+        convert_crlf_into_lf = false;
+    }
+
+    // 4. safecrlf check — Git simulates clean then smudge (`check_global_conv_flags_eol`).
+    if would_convert && opts.check_safecrlf {
+        check_safecrlf_roundtrip(conv, file_attrs, &buf, rel_path, convert_crlf_into_lf)?;
+    }
+
+    // 5. Actually convert CRLF → LF if the file has CRLFs
+    if convert_crlf_into_lf {
+        buf = crlf_to_lf(&buf);
+    }
+
+    // 6. Ident collapse (Git `ident_to_git` after filter / encode / crlf_to_git).
+    if file_attrs.ident && count_ident_regions(&buf) {
+        buf = collapse_ident(&buf);
+    }
+
+    Ok(buf)
+}
+
+/// Whether [`convert_to_git_with_opts`] returns every file at a path with these attributes
+/// unchanged.
+///
+/// Decided from configuration and attributes alone, without looking at content: no clean or
+/// process filter (required or not) and no `working-tree-encoding` applies, no `ident` collapse,
+/// and no line-ending setting can turn CRLF into LF. When this holds, a work-tree file's blob id
+/// can be computed by hashing the file as it is, for example in chunks without loading it whole.
+///
+/// # Parameters
+///
+/// - `conv` — line-ending configuration (`core.autocrlf`, `core.eol`).
+/// - `attrs` — the path's resolved attributes.
+#[must_use]
+pub(crate) fn git_conversion_is_identity(conv: &ConversionConfig, attrs: &FileAttrs) -> bool {
+    attrs.filter_process.is_none()
+        && attrs.filter_clean.is_none()
+        && !attrs.filter_clean_required
+        && attrs.working_tree_encoding.is_none()
+        && !attrs.ident
+        && input_eol_rule(conv, attrs) == InputEolRule::Never
+}
+
+/// Whether a regular worktree file can be hashed or stored by streaming raw bytes without
+/// loading it whole.
+///
+/// Matches [`git_conversion_is_identity`] when line-ending rules never apply. When the only
+/// blocker is `core.autocrlf` / `text=auto` (`InputEolRule::UnlessBinary`), probes the first
+/// 8000 bytes for a NUL (same as [`is_binary`]) and allows streaming when the file is binary.
+///
+/// Returns `false` when a clean filter, `working-tree-encoding`, `ident`, or a non-binary
+/// file needs the autocrlf index guard's stage-0 blob. Binary files stream even when indexed,
+/// matching Git's `convert.c` order (binary check before the index CRLF guard).
+///
+/// # Errors
+///
+/// Returns [`crate::error::Error::Io`] when the probe read or seek fails.
+pub(crate) fn worktree_allows_raw_byte_stream(
+    conv: &ConversionConfig,
+    attrs: &FileAttrs,
+    index_entry: Option<&crate::index::IndexEntry>,
+    file: &mut std::fs::File,
+    size: u64,
+) -> crate::error::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if attrs.filter_process.is_some()
+        || attrs.filter_clean.is_some()
+        || attrs.filter_clean_required
+        || attrs.working_tree_encoding.is_some()
+        || attrs.ident
+    {
+        return Ok(false);
+    }
+    match input_eol_rule(conv, attrs) {
+        InputEolRule::Never => Ok(true),
+        InputEolRule::Always => Ok(false),
+        InputEolRule::UnlessBinary => {
+            let probe_len = usize::try_from(size).unwrap_or(8000).min(8000);
+            if probe_len == 0 {
+                return Ok(false);
+            }
+            file.seek(SeekFrom::Start(0))
+                .map_err(crate::error::Error::Io)?;
+            let mut buf = vec![0u8; probe_len];
+            file.read_exact(&mut buf).map_err(crate::error::Error::Io)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(crate::error::Error::Io)?;
+            if is_binary(&buf) {
+                return Ok(true);
+            }
+            if index_entry.is_some() && clean_uses_autocrlf_index_guard(attrs, conv) {
+                return Ok(false);
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Decide whether CRLF/LF conversion is configured for this file on input.
+/// Returns true if the file *would* be subject to conversion (even if no
+/// actual bytes need changing).
+fn would_convert_on_input(conv: &ConversionConfig, attrs: &FileAttrs, data: &[u8]) -> bool {
+    match input_eol_rule(conv, attrs) {
+        InputEolRule::Never => false,
+        InputEolRule::Always => true,
+        InputEolRule::UnlessBinary => !is_binary(data),
+    }
+}
+
+/// Whether CRLF/LF conversion applies on input, before looking at the content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputEolRule {
+    Never,
+    Always,
+    UnlessBinary,
+}
+
+fn input_eol_rule(conv: &ConversionConfig, attrs: &FileAttrs) -> InputEolRule {
+    match attrs.crlf_legacy {
+        CrlfLegacyAttr::Unset => return InputEolRule::Never,
+        CrlfLegacyAttr::Input => return InputEolRule::UnlessBinary,
+        CrlfLegacyAttr::Crlf => {
+            if attrs.text == TextAttr::Unset {
+                return InputEolRule::Never;
+            }
+            return InputEolRule::UnlessBinary;
+        }
+        CrlfLegacyAttr::Unspecified => {}
+    }
+
+    // If text is explicitly unset (-text or binary), never convert
+    if attrs.text == TextAttr::Unset {
+        return InputEolRule::Never;
+    }
+
+    // If eol attr is set, this implies text mode
+    if attrs.eol != EolAttr::Unspecified {
+        if attrs.text == TextAttr::Auto {
+            return InputEolRule::UnlessBinary;
+        }
+        return InputEolRule::Always;
+    }
+
+    match attrs.text {
+        TextAttr::Set => return InputEolRule::Always,
+        TextAttr::Auto => return InputEolRule::UnlessBinary,
+        _ => {}
+    }
+
+    // No text attribute: fall back to core.autocrlf
+    match conv.autocrlf {
+        AutoCrlf::True | AutoCrlf::Input => InputEolRule::UnlessBinary,
+        AutoCrlf::False => InputEolRule::Never,
+    }
+}
+
+/// Git-compatible stderr when `core.safecrlf` is `warn` (clean direction, CRLF→LF).
+fn eprint_safecrlf_warn_crlf_to_lf(_rel_path: &str) {}
+
+/// Git-compatible stderr when `core.safecrlf` is `warn` (clean direction, LF→CRLF).
+fn eprint_safecrlf_warn_lf_to_crlf(_rel_path: &str) {}
+
+/// Git `convert.c` `check_global_conv_flags_eol` after simulating clean + smudge.
+fn check_safecrlf_roundtrip(
+    conv: &ConversionConfig,
+    file_attrs: &FileAttrs,
+    data: &[u8],
+    rel_path: &str,
+    convert_crlf_into_lf: bool,
+) -> Result<(), FilterError> {
+    if conv.safecrlf == SafeCrlf::False {
+        return Ok(());
+    }
+
+    let old_stats = git_text_stat(data);
+
+    let mut new_stats = old_stats.clone();
+    if convert_crlf_into_lf && new_stats.crlf > 0 {
+        new_stats.lonelf += new_stats.crlf;
+        new_stats.crlf = 0;
+    }
+    if will_convert_lf_to_crlf_from_stats(&new_stats, conv, file_attrs) {
+        new_stats.crlf += new_stats.lonelf;
+        new_stats.lonelf = 0;
+    }
+
+    if old_stats.crlf > 0 && new_stats.crlf == 0 {
+        let err = FilterError::LineEndingWouldChange {
+            detail: format!("CRLF would be replaced by LF in {rel_path}"),
+        };
+        if conv.safecrlf == SafeCrlf::True {
+            return Err(err);
+        }
+        eprint_safecrlf_warn_crlf_to_lf(rel_path);
+    } else if old_stats.lonelf > 0 && new_stats.lonelf == 0 {
+        let err = FilterError::LineEndingWouldChange {
+            detail: format!("LF would be replaced by CRLF in {rel_path}"),
+        };
+        if conv.safecrlf == SafeCrlf::True {
+            return Err(err);
+        }
+        eprint_safecrlf_warn_lf_to_crlf(rel_path);
+    }
+
+    Ok(())
+}
+
+/// Replace CRLF with LF.
+pub fn crlf_to_lf(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + 1 < data.len() && data[i] == b'\r' && data[i + 1] == b'\n' {
+            out.push(b'\n');
+            i += 2;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Replace lone LF with CRLF.
+pub fn lf_to_crlf(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + data.len() / 10);
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == b'\n' && (i == 0 || data[i - 1] != b'\r') {
+            out.push(b'\r');
+            out.push(b'\n');
+        } else {
+            out.push(data[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Output (checkout / smudge) direction
+// ---------------------------------------------------------------------------
+
+/// Convert data from the object database for writing to the working tree
+/// (the "smudge" direction).
+///
+/// This handles (Git `convert_to_working_tree_ca_internal` order):
+/// 1. Ident keyword expansion
+/// 2. LF → CRLF conversion based on config + attributes
+/// 3. `working-tree-encoding` (UTF-8 blob → working tree bytes)
+/// 4. Smudge filter execution
+///
+/// Returns `Ok(None)` when the process filter returned `status=delayed` and `delayed_checkout` was
+/// provided (Git `delayed_checkout`); the path is queued for delayed checkout finish.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_to_worktree(
+    data: &[u8],
+    rel_path: &str,
+    conv: &ConversionConfig,
+    file_attrs: &FileAttrs,
+    oid_hex: Option<&str>,
+    smudge_meta: Option<&FilterSmudgeMeta>,
+    delayed_checkout: Option<&mut crate::filter_process::DelayedProcessCheckout>,
+    filter_process: Option<&FilterProcessState>,
+) -> Result<Option<Vec<u8>>, FilterError> {
+    convert_to_worktree_with_runner(
+        data,
+        rel_path,
+        conv,
+        file_attrs,
+        oid_hex,
+        smudge_meta,
+        delayed_checkout,
+        filter_process,
+        None,
+    )
+}
+
+/// Like [`convert_to_worktree`] with an explicit filter [`CommandRunner`].
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn convert_to_worktree_with_runner(
+    data: &[u8],
+    rel_path: &str,
+    conv: &ConversionConfig,
+    file_attrs: &FileAttrs,
+    oid_hex: Option<&str>,
+    smudge_meta: Option<&FilterSmudgeMeta>,
+    delayed_checkout: Option<&mut crate::filter_process::DelayedProcessCheckout>,
+    filter_process: Option<&FilterProcessState>,
+    command_runner: Option<&dyn CommandRunner>,
+) -> Result<Option<Vec<u8>>, FilterError> {
+    let mut buf = data.to_vec();
+    let owned_filter_state;
+    let filter_state = if let Some(s) = filter_process {
+        s
+    } else {
+        owned_filter_state = FilterProcessState::new(Arc::clone(&conv.command_runner));
+        &owned_filter_state
+    };
+    let runner = command_runner.unwrap_or(conv.command_runner.as_ref());
+
+    // 1. Ident expansion
+    if file_attrs.ident {
+        if let Some(oid) = oid_hex {
+            buf = expand_ident(&buf, oid);
+        }
+    }
+
+    let can_delay_smudge = delayed_checkout.is_some()
+        && file_attrs.working_tree_encoding.is_none()
+        && !file_attrs.ident
+        && file_attrs
+            .filter_process
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+        && !should_convert_to_crlf(conv, file_attrs, &buf)
+        && file_attrs
+            .filter_process
+            .as_deref()
+            .is_some_and(|c| crate::filter_process::process_filter_supports_delay(filter_state, c));
+
+    // 2. LF→CRLF for working tree
+    let should_convert = should_convert_to_crlf(conv, file_attrs, &buf);
+    if should_convert {
+        buf = lf_to_crlf(&buf);
+    }
+
+    // 3. working-tree-encoding (Git `encode_to_worktree`)
+    if let Some(ref enc) = file_attrs.working_tree_encoding {
+        buf = encode_utf8_blob_to_working_tree_bytes(&buf, rel_path, enc)
+            .map_err(|e| filter_detail(rel_path, e.to_string()))?;
+    }
+
+    // 4. Smudge filter — process driver overrides shell smudge
+    let driver = file_attrs.filter_driver_name.as_deref().unwrap_or("");
+    if let Some(ref proc_cmd) = file_attrs.filter_process {
+        if file_attrs.filter_smudge_required {
+            start_required_process_filter(
+                filter_state,
+                proc_cmd,
+                driver,
+                rel_path,
+                FilterPhase::Smudge,
+            )?;
+        }
+        let smudge_out = match apply_process_smudge(
+            filter_state,
+            proc_cmd,
+            rel_path,
+            &buf,
+            smudge_meta,
+            can_delay_smudge,
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                if file_attrs.filter_smudge_required {
+                    return Err(external_filter_failed(
+                        rel_path,
+                        driver,
+                        FilterPhase::Smudge,
+                    ));
+                }
+                if e.starts_with("filter status: abort") {
+                    filter_state.disable_process_filter(proc_cmd);
+                }
+                return Ok(Some(buf));
+            }
+        };
+        let Some(out) = smudge_out else {
+            let Some(q) = delayed_checkout else {
+                return Err(filter_detail(
+                    rel_path,
+                    format!("internal error: delayed smudge without checkout queue for {rel_path}"),
+                ));
+            };
+            q.push_delayed(
+                proc_cmd.clone(),
+                rel_path.to_string(),
+                smudge_meta.cloned().unwrap_or_default(),
+            );
+            return Ok(None);
+        };
+        buf = out;
+    } else {
+        match file_attrs.filter_smudge.as_ref() {
+            Some(smudge_cmd) => {
+                match run_filter_command(runner, smudge_cmd, &buf, rel_path, Some(filter_state)) {
+                    Ok(filtered) => buf = filtered,
+                    Err(e) if file_attrs.filter_smudge_required => {
+                        return Err(e.into_required_error(driver, rel_path, FilterPhase::Smudge));
+                    }
+                    Err(_) => {}
+                }
+            }
+            None => {
+                if file_attrs.filter_smudge_required {
+                    return Err(external_filter_failed(
+                        rel_path,
+                        driver,
+                        FilterPhase::Smudge,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(Some(buf))
+}
+
+/// Like `convert_to_worktree` without delayed-checkout queueing (always materializes or errors).
+pub fn convert_to_worktree_eager(
+    data: &[u8],
+    rel_path: &str,
+    conv: &ConversionConfig,
+    file_attrs: &FileAttrs,
+    oid_hex: Option<&str>,
+    smudge_meta: Option<&FilterSmudgeMeta>,
+    filter_process: Option<&FilterProcessState>,
+) -> Result<Vec<u8>, FilterError> {
+    match convert_to_worktree(
+        data,
+        rel_path,
+        conv,
+        file_attrs,
+        oid_hex,
+        smudge_meta,
+        None,
+        filter_process,
+    )? {
+        Some(v) => Ok(v),
+        None => Err(filter_detail(
+            rel_path,
+            format!("internal error: unexpected delayed smudge for {rel_path}"),
+        )),
+    }
+}
+
+/// Whether [`convert_to_worktree`] returns every blob at a path with these attributes unchanged.
+///
+/// Decided from configuration and attributes alone, without looking at content: no `ident`,
+/// `working-tree-encoding`, smudge or process filter applies, and no line-ending setting can
+/// turn LF into CRLF. When this holds, a blob can be copied into the work tree verbatim, for
+/// example streamed straight from the object database.
+///
+/// # Parameters
+///
+/// - `conv` — line-ending configuration (`core.autocrlf`, `core.eol`).
+/// - `attrs` — the path's resolved attributes.
+#[must_use]
+pub(crate) fn worktree_conversion_is_identity(conv: &ConversionConfig, attrs: &FileAttrs) -> bool {
+    !attrs.ident
+        && attrs.working_tree_encoding.is_none()
+        && attrs.filter_smudge.is_none()
+        && attrs.filter_process.is_none()
+        && !attrs.filter_smudge_required
+        && !crlf_output_possible(conv, attrs)
+}
+
+/// Whether some content at this path could be converted LF→CRLF on output.
+///
+/// `false` means [`should_convert_to_crlf`] is `false` for every blob.
+fn crlf_output_possible(conv: &ConversionConfig, attrs: &FileAttrs) -> bool {
+    match attrs.crlf_legacy {
+        CrlfLegacyAttr::Unset | CrlfLegacyAttr::Input => return false,
+        CrlfLegacyAttr::Crlf => return attrs.text != TextAttr::Unset,
+        CrlfLegacyAttr::Unspecified => {}
+    }
+    if attrs.text == TextAttr::Unset {
+        return false;
+    }
+    if attrs.eol != EolAttr::Unspecified {
+        return attrs.eol == EolAttr::Crlf;
+    }
+    match attrs.text {
+        TextAttr::Set | TextAttr::Auto => output_eol_is_crlf(conv),
+        _ => conv.autocrlf == AutoCrlf::True,
+    }
+}
+
+/// Decide whether to convert LF→CRLF on output (working tree / smudge direction).
+#[must_use]
+pub fn should_convert_to_crlf(conv: &ConversionConfig, attrs: &FileAttrs, data: &[u8]) -> bool {
+    if !crlf_output_possible(conv, attrs) {
+        return false;
+    }
+    match attrs.crlf_legacy {
+        CrlfLegacyAttr::Unset | CrlfLegacyAttr::Input => return false,
+        CrlfLegacyAttr::Crlf => {
+            if attrs.text == TextAttr::Unset {
+                return false;
+            }
+            // Legacy `crlf` (set) forces CRLF on checkout (even for paths Git
+            // would otherwise treat as binary; see t0020 "t* crlf" + `three`).
+            return true;
+        }
+        CrlfLegacyAttr::Unspecified => {}
+    }
+
+    // If text is explicitly unset, never convert
+    if attrs.text == TextAttr::Unset {
+        return false;
+    }
+
+    // If there's an explicit eol attribute
+    if attrs.eol != EolAttr::Unspecified {
+        if attrs.text == TextAttr::Auto && is_binary(data) {
+            return false;
+        }
+        if attrs.eol != EolAttr::Crlf {
+            return false;
+        }
+        // `text=auto` + `eol=crlf` → Git `CRLF_AUTO_CRLF` (safe mixed handling).
+        if attrs.text == TextAttr::Auto {
+            return auto_crlf_should_smudge_lf_to_crlf(data);
+        }
+        // Explicit `eol=crlf` with `text` set, etc. → `CRLF_TEXT_CRLF` (always normalize).
+        return true;
+    }
+
+    // If text is explicitly set, use eol config
+    if attrs.text == TextAttr::Set {
+        return output_eol_is_crlf(conv);
+    }
+
+    if attrs.text == TextAttr::Auto {
+        if is_binary(data) {
+            return false;
+        }
+        if !output_eol_is_crlf(conv) {
+            return false;
+        }
+        return auto_crlf_should_smudge_lf_to_crlf(data);
+    }
+
+    // No text attribute: fall back to core.autocrlf
+    match conv.autocrlf {
+        AutoCrlf::True => {
+            if is_binary(data) {
+                return false;
+            }
+            auto_crlf_should_smudge_lf_to_crlf(data)
+        }
+        AutoCrlf::Input | AutoCrlf::False => false,
+    }
+}
+
+/// Whether the output EOL should be CRLF based on config.
+fn output_eol_is_crlf(conv: &ConversionConfig) -> bool {
+    // Git `text_eol_is_crlf`: autocrlf=input forces LF output before `core.eol` is consulted.
+    if conv.autocrlf == AutoCrlf::Input {
+        return false;
+    }
+    if conv.autocrlf == AutoCrlf::True {
+        return true;
+    }
+    match conv.eol {
+        CoreEol::Crlf => true,
+        CoreEol::Lf => false,
+        CoreEol::Native => {
+            // On Unix, native is LF
+            cfg!(windows)
+        }
+    }
+}
+
+/// Expand `$Id$` → `$Id: <oid>$` in data.
+///
+/// Matches Git's `ident_to_worktree` in `convert.c`: same-line `$` terminator, and foreign
+/// idents (internal spaces before the closing `$`) are left unchanged.
+fn expand_ident(data: &[u8], oid: &str) -> Vec<u8> {
+    if !count_ident_regions(data) {
+        return data.to_vec();
+    }
+    let replacement = format!("$Id: {oid} $");
+    let mut out = Vec::with_capacity(data.len() + 60);
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != b'$' {
+            out.push(data[i]);
+            i += 1;
+            continue;
+        }
+        if i + 3 > data.len() || data[i + 1] != b'I' || data[i + 2] != b'd' {
+            out.push(data[i]);
+            i += 1;
+            continue;
+        }
+        let after_id = i + 3;
+        let ch = data.get(after_id).copied();
+        match ch {
+            Some(b'$') => {
+                out.extend_from_slice(replacement.as_bytes());
+                i = after_id + 1;
+            }
+            Some(b':') => {
+                let rest = &data[after_id + 1..];
+                let line_end = rest
+                    .iter()
+                    .position(|&b| b == b'\n' || b == b'\r')
+                    .unwrap_or(rest.len());
+                let line = &rest[..line_end];
+                let Some(dollar_rel) = line.iter().position(|&b| b == b'$') else {
+                    out.push(data[i]);
+                    i += 1;
+                    continue;
+                };
+                if line[..dollar_rel].contains(&b'\n') {
+                    out.push(data[i]);
+                    i += 1;
+                    continue;
+                }
+                // Foreign ident (Git `ident_to_worktree`): first space in the payload after the
+                // byte following `:` must not be the last character before `$`.
+                let payload = &line[..dollar_rel];
+                let foreign = payload.len() > 1
+                    && payload[1..]
+                        .iter()
+                        .position(|&b| b == b' ')
+                        .is_some_and(|rel| {
+                            let pos = 1 + rel;
+                            pos < payload.len().saturating_sub(1)
+                        });
+                if foreign {
+                    out.push(data[i]);
+                    i += 1;
+                    continue;
+                }
+                out.extend_from_slice(replacement.as_bytes());
+                i = after_id + 1 + dollar_rel + 1;
+            }
+            _ => {
+                out.push(data[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Whether the buffer contains any `$Id$` / `$Id: ... $` regions Git would rewrite (`count_ident`).
+fn count_ident_regions(data: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < data.len() {
+        if data[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if i + 3 > data.len() || data[i + 1] != b'I' || data[i + 2] != b'd' {
+            i += 1;
+            continue;
+        }
+        let after = i + 3;
+        match data.get(after).copied() {
+            Some(b'$') => return true,
+            Some(b':') => {
+                let mut j = after + 1;
+                let mut found = false;
+                while j < data.len() {
+                    match data[j] {
+                        b'$' => {
+                            found = true;
+                            break;
+                        }
+                        // Git `ident_to_git` / `count_ident`: LF ends the scan; CR may appear
+                        // inside the payload before the closing `$`.
+                        b'\n' => break,
+                        _ => j += 1,
+                    }
+                }
+                if found {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Collapse `$Id: ... $` back to `$Id$`.
+pub fn collapse_ident(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + 4 <= data.len() && &data[i..i + 4] == b"$Id:" {
+            let rest = &data[i + 4..];
+            let line_end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+            let line = &rest[..line_end];
+            if let Some(end) = line.iter().position(|&b| b == b'$') {
+                out.extend_from_slice(b"$Id$");
+                i += 4 + end + 1;
+                continue;
+            }
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Shell-quote `s` with single quotes, matching Git's `sq_quote_buf` (`'` → `'\''`).
+fn sq_quote_buf(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Expand Git filter command placeholders: `%%` → `%`, `%f` → quoted repository-relative path.
+fn expand_filter_command(cmd: &str, rel_path: &str) -> String {
+    let mut out = String::with_capacity(cmd.len() + rel_path.len() + 8);
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.peek() {
+                Some('%') => {
+                    chars.next();
+                    out.push('%');
+                }
+                Some('f') => {
+                    chars.next();
+                    out.push_str(&sq_quote_buf(rel_path));
+                }
+                _ => out.push('%'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Run a filter command, piping data through stdin→stdout.
+pub fn run_filter(
+    runner: &dyn CommandRunner,
+    cmd: &str,
+    data: &[u8],
+    rel_path: &str,
+) -> Result<Vec<u8>, FilterError> {
+    run_filter_command(runner, cmd, data, rel_path, None).map_err(|e| match e {
+        FilterRunError::Spawn { source, .. } | FilterRunError::Io(source) => {
+            filter_detail(rel_path, source.to_string())
+        }
+        FilterRunError::Exit(status) => FilterError::Failed { status },
+    })
+}
+
+/// How a one-shot clean/smudge command failed.
+#[derive(Debug)]
+enum FilterRunError {
+    /// `program` could not be spawned.
+    Spawn {
+        program: PathBuf,
+        source: std::io::Error,
+    },
+    /// Piping data to or from the running command failed.
+    Io(std::io::Error),
+    /// The command exited with this non-zero status.
+    Exit(i32),
+}
+
+impl FilterRunError {
+    /// The error for a failure of a `filter.<driver>.required` filter.
+    fn into_required_error(self, driver: &str, rel_path: &str, phase: FilterPhase) -> FilterError {
+        match self {
+            Self::Spawn { program, source } => {
+                filter_spawn_failed(driver, rel_path, phase, &program, &source)
+            }
+            Self::Io(_) | Self::Exit(_) => external_filter_failed(rel_path, driver, phase),
+        }
+    }
+}
+
+fn filter_spawn_failed(
+    driver: &str,
+    rel_path: &str,
+    phase: FilterPhase,
+    program: &Path,
+    source: &std::io::Error,
+) -> FilterError {
+    FilterError::ExternalFilterSpawnFailed {
+        driver: driver.to_owned(),
+        path: rel_path.to_owned(),
+        phase,
+        program: program.display().to_string(),
+        kind: source.kind(),
+        detail: source.to_string(),
+    }
+}
+
+fn run_filter_command(
+    runner: &dyn CommandRunner,
+    cmd: &str,
+    data: &[u8],
+    rel_path: &str,
+    filter_state: Option<&FilterProcessState>,
+) -> Result<Vec<u8>, FilterRunError> {
+    let expanded = expand_filter_command(cmd, rel_path);
+    let mut spec = CommandSpec::sh_dash_c_filter(expanded);
+    if let Some(st) = filter_state {
+        st.apply_subprocess_to_spec(&mut spec);
+    }
+    spec.stdin = CommandStdin::Pipe(data.to_vec());
+    let output = runner
+        .spawn(&spec)
+        .map_err(|source| FilterRunError::Spawn {
+            program: spec.program.clone(),
+            source,
+        })?
+        .wait_with_output()
+        .map_err(FilterRunError::Io)?;
+    if !output.status.success {
+        return Err(FilterRunError::Exit(output.status.code.unwrap_or(1)));
+    }
+    Ok(output.stdout)
+}
+
+/// Start the long-running filter `proc_cmd` before a required filter uses it, so a spawn
+/// failure is reported with its cause instead of as a generic filter failure.
+fn start_required_process_filter(
+    filter_state: &FilterProcessState,
+    proc_cmd: &str,
+    driver: &str,
+    rel_path: &str,
+    phase: FilterPhase,
+) -> Result<(), FilterError> {
+    if filter_state.process_filter_is_disabled(proc_cmd) {
+        return Ok(());
+    }
+    match crate::filter_process::start_process_filter(filter_state, proc_cmd) {
+        Err(crate::filter_process::ProcessFilterStartError::Spawn(source)) => Err(
+            filter_spawn_failed(driver, rel_path, phase, Path::new("sh"), &source),
+        ),
+        // Handshake failures surface from the filter call itself, as before.
+        Err(crate::filter_process::ProcessFilterStartError::Other(_)) | Ok(()) => Ok(()),
+    }
+}
+
+// Re-export AttrRule type is internal, but we expose the vec through load_gitattributes.
+// The public API uses the opaque Vec from load_gitattributes + get_file_attrs.
+
+/// Opaque type alias for loaded gitattributes rules.
+pub type GitAttributes = Vec<AttrRule>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Attribute and config combinations covering every line-ending branch.
+    fn conversion_matrix() -> Vec<(ConversionConfig, FileAttrs)> {
+        let mut out = Vec::new();
+        for autocrlf in [AutoCrlf::False, AutoCrlf::True, AutoCrlf::Input] {
+            for eol in [CoreEol::Lf, CoreEol::Crlf, CoreEol::Native] {
+                for text in [
+                    TextAttr::Set,
+                    TextAttr::Auto,
+                    TextAttr::Unset,
+                    TextAttr::Unspecified,
+                ] {
+                    for attr_eol in [EolAttr::Unspecified, EolAttr::Lf, EolAttr::Crlf] {
+                        for crlf_legacy in [
+                            CrlfLegacyAttr::Unspecified,
+                            CrlfLegacyAttr::Crlf,
+                            CrlfLegacyAttr::Input,
+                            CrlfLegacyAttr::Unset,
+                        ] {
+                            let conv = ConversionConfig {
+                                autocrlf,
+                                eol,
+                                safecrlf: SafeCrlf::False,
+                                command_runner: system_command_runner(),
+                            };
+                            let attrs = FileAttrs {
+                                text,
+                                eol: attr_eol,
+                                crlf_legacy,
+                                ..FileAttrs::default()
+                            };
+                            out.push((conv, attrs));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    const SAMPLES: [&[u8]; 4] = [
+        b"a\nb\n",
+        b"a\r\nb\r\n",
+        b"mixed\r\nends\n",
+        b"bin\0\r\nary\n",
+    ];
+
+    #[test]
+    fn worktree_identity_implies_no_output_conversion_for_any_content() {
+        let mut identities = 0;
+        for (conv, attrs) in conversion_matrix() {
+            if !worktree_conversion_is_identity(&conv, &attrs) {
+                continue;
+            }
+            identities += 1;
+            for data in SAMPLES {
+                let out = convert_to_worktree(data, "f", &conv, &attrs, None, None, None, None)
+                    .expect("convert")
+                    .expect("not delayed");
+                assert_eq!(out, data, "{conv:?} {attrs:?} changed {data:?}");
+            }
+        }
+        assert!(identities > 0);
+    }
+
+    #[test]
+    fn git_identity_implies_no_input_conversion_for_any_content() {
+        let mut identities = 0;
+        for (conv, attrs) in conversion_matrix() {
+            if !git_conversion_is_identity(&conv, &attrs) {
+                continue;
+            }
+            identities += 1;
+            for data in SAMPLES {
+                let out = convert_to_git_with_opts(
+                    data,
+                    "f",
+                    &conv,
+                    &attrs,
+                    ConvertToGitOpts {
+                        index_blob: None,
+                        renormalize: false,
+                        check_safecrlf: false,
+                        filter_process: None,
+                        command_runner: None,
+                    },
+                )
+                .expect("convert");
+                assert_eq!(out, data, "{conv:?} {attrs:?} changed {data:?}");
+            }
+        }
+        assert!(identities > 0);
+    }
+
+    #[test]
+    fn raw_byte_streaming_under_autocrlf_when_binary() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut conv = ConversionConfig::from_config(&ConfigSet::new());
+        conv.autocrlf = AutoCrlf::True;
+        let attrs = FileAttrs::default();
+        assert!(!git_conversion_is_identity(&conv, &attrs));
+
+        let nul_file = tempfile::NamedTempFile::new().expect("temp");
+        nul_file.as_file().write_all(&[0u8; 9000]).expect("write");
+        let mut with_nul = nul_file.reopen().expect("reopen");
+        assert!(worktree_allows_raw_byte_stream(&conv, &attrs, None, &mut with_nul, 9000).unwrap());
+
+        let text_file = tempfile::NamedTempFile::new().expect("temp");
+        text_file
+            .as_file()
+            .write_all(b"hello\r\nworld")
+            .expect("write");
+        let mut text = text_file.reopen().expect("reopen");
+        assert!(!worktree_allows_raw_byte_stream(&conv, &attrs, None, &mut text, 12).unwrap());
+
+        let mut data = vec![1u8; 20_000];
+        data[500] = 0;
+        let huge_file = tempfile::NamedTempFile::new().expect("temp");
+        huge_file.as_file().write_all(&data).expect("write");
+        let mut huge = huge_file.reopen().expect("reopen");
+        huge.seek(SeekFrom::Start(10_000)).expect("seek");
+        assert!(worktree_allows_raw_byte_stream(&conv, &attrs, None, &mut huge, 20_000).unwrap());
+
+        use crate::index::{IndexEntry, MODE_REGULAR};
+        use crate::objects::ObjectId;
+        let indexed = IndexEntry {
+            ctime_sec: 1,
+            ctime_nsec: 0,
+            mtime_sec: 1,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode: MODE_REGULAR,
+            uid: 0,
+            gid: 0,
+            size: 9000,
+            oid: ObjectId::zero(),
+            flags: 0,
+            flags_extended: None,
+            path: b"f.bin".to_vec(),
+            base_index_pos: 0,
+        };
+        assert!(clean_uses_autocrlf_index_guard(&attrs, &conv));
+        let mut again = nul_file.reopen().expect("reopen");
+        assert!(
+            worktree_allows_raw_byte_stream(&conv, &attrs, Some(&indexed), &mut again, 9000)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn identity_checks_see_filters_ident_and_encoding() {
+        let conv = ConversionConfig::from_config(&ConfigSet::new());
+        assert!(worktree_conversion_is_identity(
+            &conv,
+            &FileAttrs::default()
+        ));
+        assert!(git_conversion_is_identity(&conv, &FileAttrs::default()));
+        let with = |f: &dyn Fn(&mut FileAttrs)| {
+            let mut attrs = FileAttrs::default();
+            f(&mut attrs);
+            attrs
+        };
+        for attrs in [
+            with(&|a| a.ident = true),
+            with(&|a| a.working_tree_encoding = Some("UTF-16".into())),
+            with(&|a| a.filter_smudge = Some("cat".into())),
+            with(&|a| a.filter_process = Some("proc".into())),
+            with(&|a| a.filter_smudge_required = true),
+        ] {
+            assert!(!worktree_conversion_is_identity(&conv, &attrs), "{attrs:?}");
+        }
+        for attrs in [
+            with(&|a| a.ident = true),
+            with(&|a| a.working_tree_encoding = Some("UTF-16".into())),
+            with(&|a| a.filter_clean = Some("cat".into())),
+            with(&|a| a.filter_process = Some("proc".into())),
+            with(&|a| a.filter_clean_required = true),
+        ] {
+            assert!(!git_conversion_is_identity(&conv, &attrs), "{attrs:?}");
+        }
+    }
+
+    #[test]
+    fn collapse_ident_allows_cr_before_closing_dollar() {
+        let data = b"$Id: abc\r$\n";
+        assert_eq!(collapse_ident(data), b"$Id$\n");
+    }
+
+    #[test]
+    fn convert_to_git_collapses_ident_with_cr_before_closing_dollar() {
+        let conv = ConversionConfig::from_config(&ConfigSet::new());
+        let mut attrs = FileAttrs::default();
+        attrs.ident = true;
+        let data = b"$Id: abc\r$\n";
+        let out = convert_to_git(data, "f", &conv, &attrs).expect("convert");
+        assert_eq!(out, b"$Id$\n");
+    }
+
+    #[test]
+    fn convert_to_git_collapses_expanded_ident_to_keyword() {
+        let conv = ConversionConfig::from_config(&ConfigSet::new());
+        let mut attrs = FileAttrs::default();
+        attrs.ident = true;
+        let expanded = b"$Id: 10d2a9379e5d822c92a372599358dd0e616aadac $\nfoo\n";
+        let out = convert_to_git(expanded, "id.txt", &conv, &attrs).expect("convert");
+        assert_eq!(out, b"$Id$\nfoo\n");
+    }
+
+    #[test]
+    fn test_crlf_to_lf() {
+        assert_eq!(crlf_to_lf(b"hello\r\nworld\r\n"), b"hello\nworld\n");
+        assert_eq!(crlf_to_lf(b"hello\nworld\n"), b"hello\nworld\n");
+        assert_eq!(crlf_to_lf(b"hello\r\n"), b"hello\n");
+    }
+
+    #[test]
+    fn test_lf_to_crlf() {
+        assert_eq!(lf_to_crlf(b"hello\nworld\n"), b"hello\r\nworld\r\n");
+        assert_eq!(lf_to_crlf(b"hello\r\nworld\r\n"), b"hello\r\nworld\r\n");
+    }
+
+    #[test]
+    fn test_has_crlf() {
+        assert!(has_crlf(b"hello\r\nworld"));
+        assert!(!has_crlf(b"hello\nworld"));
+    }
+
+    #[test]
+    fn smudge_mixed_line_endings_unchanged_with_autocrlf_true() {
+        let mut blob = Vec::new();
+        for part in [
+            b"Oh\n".as_slice(),
+            b"here\n",
+            b"is\n",
+            b"CRLF\r\n",
+            b"in\n",
+            b"text\n",
+        ] {
+            blob.extend_from_slice(part);
+        }
+        let conv = ConversionConfig {
+            autocrlf: AutoCrlf::True,
+            eol: CoreEol::Lf,
+            safecrlf: SafeCrlf::False,
+            command_runner: system_command_runner(),
+        };
+        let attrs = FileAttrs::default();
+        let out =
+            convert_to_worktree_eager(&blob, "mixed", &conv, &attrs, None, None, None).unwrap();
+        assert_eq!(out, blob);
+    }
+
+    #[test]
+    fn smudge_lf_only_gets_crlf_with_autocrlf_true() {
+        let blob = b"a\nb\n";
+        let conv = ConversionConfig {
+            autocrlf: AutoCrlf::True,
+            eol: CoreEol::Lf,
+            safecrlf: SafeCrlf::False,
+            command_runner: system_command_runner(),
+        };
+        let attrs = FileAttrs::default();
+        let out = convert_to_worktree_eager(blob, "x", &conv, &attrs, None, None, None).unwrap();
+        assert_eq!(out, b"a\r\nb\r\n");
+    }
+
+    #[test]
+    fn test_is_binary() {
+        assert!(is_binary(b"hello\0world"));
+        assert!(!is_binary(b"hello world"));
+    }
+
+    #[test]
+    fn attr_dir_only_pattern_does_not_match_same_named_file() {
+        let rules = parse_gitattributes_content("dir-only-pattern/ text\n");
+        let rule = &rules[0];
+        assert!(!attr_rule_matches(rule, "parent/dir-only-pattern", false));
+        assert!(attr_rule_matches(rule, "dir-only-pattern", true));
+    }
+
+    #[test]
+    fn test_expand_collapse_ident() {
+        let data = b"$Id$";
+        let expanded = expand_ident(data, "abc123");
+        assert_eq!(expanded, b"$Id: abc123 $");
+        let collapsed = collapse_ident(&expanded);
+        assert_eq!(collapsed, b"$Id$");
+    }
+
+    #[test]
+    fn expand_ident_does_not_span_lines_for_partial_keyword() {
+        let data = b"$Id: NoTerminatingSymbol\n$Id: deadbeef $\n";
+        let expanded = expand_ident(data, "newoid");
+        assert_eq!(expanded, b"$Id: NoTerminatingSymbol\n$Id: newoid $\n");
+    }
+
+    #[test]
+    fn expand_ident_preserves_foreign_id_with_internal_spaces() {
+        let data = b"$Id: Foreign Commit With Spaces $\n";
+        let expanded = expand_ident(data, "abc");
+        assert_eq!(expanded, data);
+    }
+
+    #[test]
+    fn expand_filter_command_percent_f_quotes_path() {
+        let s = expand_filter_command("sh ./x.sh %f --extra", "name  with 'sq'");
+        assert_eq!(s, "sh ./x.sh 'name  with '\\''sq'\\''' --extra");
+        assert_eq!(expand_filter_command("a %% b", "p"), "a % b");
+    }
+}

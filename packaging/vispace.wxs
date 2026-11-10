@@ -1,0 +1,32 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="ViSpace" Manufacturer="ViSpace" Version="$(Version)"
+           UpgradeCode="ED1B46D8-B8DB-4C94-9580-124E21C983D7" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ViSpace is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="InstallFolder" Name="ViSpace">
+        <Component Id="Application">
+          <File Id="ViSpaceExe" Source="$(BinDir)\vispace.exe" KeyPath="yes">
+            <Shortcut Id="ViSpaceShortcut" Directory="ProgramMenuFolder"
+                      Name="ViSpace" Advertise="yes" WorkingDirectory="InstallFolder" />
+          </File>
+        </Component>
+        <Component Id="DiscoveryHelper">
+          <File Source="$(BinDir)\vispace-discovery.exe" />
+        </Component>
+        <Directory Id="LicensesFolder" Name="licenses" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <Feature Id="ViSpace" Title="ViSpace" Level="1">
+      <ComponentRef Id="Application" />
+      <ComponentRef Id="DiscoveryHelper" />
+      <ComponentGroupRef Id="LicenseFiles" />
+    </Feature>
+    <ComponentGroup Id="LicenseFiles" Directory="LicensesFolder">
+      <Files Include="$(SourceDir)\assets\licenses\*.txt" />
+      <Files Include="$(SourceDir)\LICENSE" />
+      <Files Include="$(SourceDir)\THIRD_PARTY_NOTICES.md" />
+    </ComponentGroup>
+  </Package>
+</Wix>

@@ -1,0 +1,336 @@
+//! Git commit encoding labels (`encoding` header, `i18n.commitEncoding`) mapped to codecs.
+//!
+//! Git's `ISO-8859-1` is strict Latin-1; `encoding_rs` maps that label to Windows-1252, so we
+//! handle Latin-1 separately.
+
+use encoding_rs::Encoding;
+
+pub(crate) fn is_iso_8859_1(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "iso-8859-1" | "iso8859-1" | "latin1" | "latin-1"
+    )
+}
+
+/// Map each byte to U+0000..U+00FF for Git-style line diffs on non-UTF-8 blobs.
+pub(crate) fn decode_latin1(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len());
+    for &b in bytes {
+        s.push(char::from_u32(u32::from(b)).unwrap_or('\u{FFFD}'));
+    }
+    s
+}
+
+/// Encode Unicode to Latin-1 bytes when every scalar is in U+0000..=U+00FF.
+///
+/// Used for `working-tree-encoding` smudge; returns `None` if any character is unrepresentable
+/// (Git reports a conversion failure instead of substituting bytes).
+pub(crate) fn encode_latin1_strict(unicode: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(unicode.len());
+    for c in unicode.chars() {
+        let cp = u32::from(c);
+        if cp > 0xFF {
+            return None;
+        }
+        out.push(cp as u8);
+    }
+    Some(out)
+}
+
+/// Encode a string produced by [`decode_latin1`] back to raw bytes for patch output.
+pub(crate) fn encode_latin1_lossy(unicode: &str) -> Vec<u8> {
+    unicode
+        .chars()
+        .map(|c| {
+            let cp = u32::from(c);
+            if cp <= 0xFF {
+                cp as u8
+            } else {
+                b'?'
+            }
+        })
+        .collect()
+}
+
+/// Latin-1 working-tree bytes → UTF-8 blob bytes (Git `working-tree-encoding` clean filter).
+pub(crate) fn worktree_latin1_to_utf8_bytes(bytes: &[u8]) -> Vec<u8> {
+    decode_latin1(bytes).into_bytes()
+}
+
+/// UTF-8 blob bytes → Latin-1 working-tree bytes (Git smudge filter).
+pub(crate) fn utf8_bytes_to_worktree_latin1(utf8: &[u8]) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(utf8).ok()?;
+    encode_latin1_strict(s)
+}
+
+/// Find the offset of the first byte that is not part of a strictly valid UTF-8
+/// sequence, mirroring Git's `find_invalid_utf8` (commit.c).
+///
+/// This is stricter than [`core::str::from_utf8`]: in addition to rejecting
+/// malformed/overlong sequences and surrogates, it also rejects the Unicode
+/// non-characters `U+xxFFFE`, `U+xxFFFF`, and the range `U+FDD0..=U+FDEF`, which
+/// Rust's standard library accepts. Returns `None` when the whole buffer is valid.
+#[must_use]
+pub fn find_invalid_utf8(buf: &[u8]) -> Option<usize> {
+    const MAX_CODEPOINT: [u32; 4] = [0x7f, 0x7ff, 0xffff, 0x10ffff];
+    let mut i = 0usize;
+    while i < buf.len() {
+        let c = buf[i];
+        let bad_offset = i;
+        i += 1;
+        // Simple US-ASCII? No worries.
+        if c < 0x80 {
+            continue;
+        }
+        // Count how many more high bits are set: that's how many more bytes
+        // this sequence should have.
+        let mut bytes = 0usize;
+        let mut cc = c;
+        while cc & 0x40 != 0 {
+            cc <<= 1;
+            bytes += 1;
+        }
+        // Must be between 1 and 3 more bytes.
+        if !(1..=3).contains(&bytes) {
+            return Some(bad_offset);
+        }
+        // Do we have that many bytes?
+        if buf.len() - i < bytes {
+            return Some(bad_offset);
+        }
+        let mut codepoint = (u32::from(cc) & 0x7f) >> bytes;
+        let min_val = MAX_CODEPOINT[bytes - 1] + 1;
+        let max_val = MAX_CODEPOINT[bytes];
+        // Verify that they are good continuation bytes.
+        for _ in 0..bytes {
+            let b = buf[i];
+            codepoint = (codepoint << 6) | (u32::from(b) & 0x3f);
+            if b & 0xc0 != 0x80 {
+                return Some(bad_offset);
+            }
+            i += 1;
+        }
+        if codepoint < min_val || codepoint > max_val {
+            return Some(bad_offset);
+        }
+        // Reject the UTF-16 surrogate block (U+D800..=U+DFFF): it has no
+        // legal UTF-8 encoding.
+        if codepoint & 0x1f_f800 == 0xd800 {
+            return Some(bad_offset);
+        }
+        // The last two code points of every plane (..FFFE and ..FFFF) are
+        // permanent non-characters.
+        if codepoint & 0xfffe == 0xfffe {
+            return Some(bad_offset);
+        }
+        // So is anything in the range U+FDD0..=U+FDEF.
+        if (0xfdd0..=0xfdef).contains(&codepoint) {
+            return Some(bad_offset);
+        }
+    }
+    None
+}
+
+/// Whether `buf` is strictly valid UTF-8 per Git's rules (see [`find_invalid_utf8`]).
+#[must_use]
+pub fn is_strict_utf8(buf: &[u8]) -> bool {
+    find_invalid_utf8(buf).is_none()
+}
+
+/// Git stores the commit message body with a trailing newline when non-empty.
+#[must_use]
+pub fn ensure_body_trailing_newline(mut bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
+/// Resolve an encoding label the way Git uses it in config and commit objects.
+///
+/// Git accepts names like `eucJP` that [`Encoding::for_label`] does not recognize.
+/// ISO-8859-1 is handled separately as strict Latin-1 and returns `None`.
+#[must_use]
+pub fn resolve(label: &str) -> Option<&'static Encoding> {
+    let t = label.trim();
+    if t.is_empty() || is_iso_8859_1(t) {
+        return None;
+    }
+    let normalized = t.replace('_', "-");
+    let lower = normalized.to_ascii_lowercase();
+    let mapped = match lower.as_str() {
+        "eucjp" => "euc-jp",
+        "cp932" | "mskanji" | "sjis" => "shift_jis",
+        _ => normalized.as_str(),
+    };
+    Encoding::for_label(mapped.as_bytes()).or_else(|| Encoding::for_label(t.as_bytes()))
+}
+
+/// Encode `unicode` for storage in a commit message body using Git's encoding name.
+#[must_use]
+pub fn encode_unicode(label: &str, unicode: &str) -> Option<Vec<u8>> {
+    let t = label.trim();
+    let raw = if is_iso_8859_1(t) {
+        encode_latin1_lossy(unicode)
+    } else {
+        let enc = resolve(t)?;
+        let (cow, _, _) = enc.encode(unicode);
+        cow.into_owned()
+    };
+    Some(ensure_body_trailing_newline(raw))
+}
+
+/// Encode a single header field (author/committer line) without adding a trailing newline.
+#[must_use]
+pub fn encode_header_text(label: &str, unicode: &str) -> Option<Vec<u8>> {
+    let t = label.trim();
+    if is_iso_8859_1(t) {
+        return Some(encode_latin1_lossy(unicode));
+    }
+    let enc = resolve(t)?;
+    let (cow, _, _) = enc.encode(unicode);
+    Some(cow.into_owned())
+}
+
+/// Decode `bytes` using Git's encoding name, or lossy UTF-8 if unknown.
+#[must_use]
+pub fn decode_bytes(label: Option<&str>, bytes: &[u8]) -> String {
+    if let Some(l) = label {
+        if is_iso_8859_1(l) {
+            return decode_latin1(bytes);
+        }
+        if let Some(enc) = resolve(l) {
+            let (cow, _) = enc.decode_without_bom_handling(bytes);
+            return cow.into_owned();
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Prepare a commit message for storage per `i18n.commitEncoding` (or equivalent).
+///
+/// When the configured encoding is not UTF-8, returns [`Some`] raw bytes for the body
+/// and sets `encoding` in the commit object; otherwise UTF-8 is stored without an
+/// `encoding` header.
+#[must_use]
+pub fn finalize_stored_commit_message(
+    message: String,
+    commit_encoding: Option<&str>,
+) -> (String, Option<String>, Option<Vec<u8>>) {
+    let is_utf8 = match commit_encoding {
+        None => true,
+        Some(e) => e.eq_ignore_ascii_case("utf-8") || e.eq_ignore_ascii_case("utf8"),
+    };
+    if is_utf8 {
+        return (message, None, None);
+    }
+    let Some(label) = commit_encoding.filter(|s| !s.trim().is_empty()) else {
+        return (message, None, None);
+    };
+    let Some(raw) = encode_unicode(label, &message) else {
+        return (message, None, None);
+    };
+    (message, Some(label.to_owned()), Some(raw))
+}
+
+/// Raw `author` / `committer` header payloads for a new commit object.
+///
+/// When `encoding` is unset or UTF-8, returns empty vectors so
+/// [`crate::objects::serialize_commit`] writes the Unicode [`String`] fields as UTF-8.
+/// When `encoding` is non-UTF-8, encodes the full identity lines (name, email, timestamp)
+/// for storage in that charset.
+#[must_use]
+pub fn identity_raw_for_serialized_commit(
+    encoding: &Option<String>,
+    author: &str,
+    committer: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let is_utf8 = match encoding.as_deref() {
+        None => true,
+        Some(e) => e.eq_ignore_ascii_case("utf-8") || e.eq_ignore_ascii_case("utf8"),
+    };
+    if is_utf8 {
+        return (Vec::new(), Vec::new());
+    }
+    let Some(label) = encoding.as_deref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let author_raw = encode_header_text(label, author).unwrap_or_default();
+    let committer_raw = encode_header_text(label, committer).unwrap_or_default();
+    (author_raw, committer_raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_utf8_accepts_plain_ascii_and_multibyte() {
+        assert!(is_strict_utf8(b"Commit message\n"));
+        // Valid multi-byte UTF-8 (Latin small letter a with acute, CJK).
+        assert!(is_strict_utf8("Ábçdèfg はれひほふ".as_bytes()));
+        // ISO-2022-JP is a 7-bit encoding using ESC control bytes; valid UTF-8.
+        assert!(is_strict_utf8(b"\x1b$B$O$l$R$[$U\x1b(B"));
+    }
+
+    #[test]
+    fn strict_utf8_rejects_surrogates() {
+        // Encoded surrogate U+D800 (ED A0 80) — invalid in UTF-8.
+        assert_eq!(find_invalid_utf8(b"abc\xed\xa0\x80"), Some(3));
+        assert!(!is_strict_utf8(b"\xed\xa0\x80"));
+    }
+
+    #[test]
+    fn strict_utf8_rejects_overlong_sequences() {
+        // Overlong encoding of U+0029 and the C0 A0 "fake space".
+        assert!(!is_strict_utf8(b"\xe0\x82\xa9"));
+        assert!(!is_strict_utf8(b"\xc0\xa0"));
+    }
+
+    #[test]
+    fn strict_utf8_rejects_noncharacters_rust_would_accept() {
+        // U+10FFFE non-character: F4 8F BF BE.
+        assert!(core::str::from_utf8(b"\xf4\x8f\xbf\xbe").is_ok());
+        assert!(!is_strict_utf8(b"\xf4\x8f\xbf\xbe"));
+        // U+FDD0 (in the U+FDD0..=U+FDEF non-character block): EF B7 90.
+        assert!(core::str::from_utf8(b"\xef\xb7\x90").is_ok());
+        assert!(!is_strict_utf8(b"\xef\xb7\x90"));
+    }
+
+    #[test]
+    fn latin1_round_trips_through_encode_and_decode() {
+        let unicode = "Áéí óú";
+        let encoded = encode_header_text("ISO8859-1", unicode).expect("latin1 encodes");
+        assert_eq!(encoded, vec![0xC1, 0xE9, 0xED, 0x20, 0xF3, 0xFA]);
+        assert_eq!(decode_bytes(Some("ISO8859-1"), &encoded), unicode);
+    }
+
+    #[test]
+    fn iso8859_1_aliases_for_worktree_encoding() {
+        for label in ["latin1", "ISO8859-1", "ISO-8859-1", "latin-1", "  LATIN1  "] {
+            assert!(is_iso_8859_1(label), "expected Latin-1 alias: {label}");
+        }
+    }
+
+    #[test]
+    fn worktree_latin1_round_trip_bytes() {
+        let worktree = b"h\xe9llo\n";
+        let utf8_blob = worktree_latin1_to_utf8_bytes(worktree);
+        assert_eq!(utf8_blob, b"h\xc3\xa9llo\n");
+        assert_eq!(
+            utf8_bytes_to_worktree_latin1(&utf8_blob).as_deref(),
+            Some(worktree.as_slice())
+        );
+    }
+
+    #[test]
+    fn worktree_latin1_smudge_rejects_unrepresentable_utf8() {
+        let euro_utf8 = b"\xe2\x82\xac\n";
+        assert!(utf8_bytes_to_worktree_latin1(euro_utf8).is_none());
+        assert_eq!(
+            encode_latin1_lossy(std::str::from_utf8(euro_utf8).unwrap()),
+            b"?\n",
+            "commit-message path stays lossy"
+        );
+    }
+}

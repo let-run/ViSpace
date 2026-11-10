@@ -1,0 +1,126 @@
+diff --git a/grit-lib/src/atomic_replace.rs b/grit-lib/src/atomic_replace.rs
+--- a/grit-lib/src/atomic_replace.rs
++++ b/grit-lib/src/atomic_replace.rs
+@@ -19,6 +19,7 @@
+     if err.kind() == io::ErrorKind::WouldBlock {
+         return true;
+     }
++    #[cfg(any(unix, windows))]
+     if let Some(raw) = err.raw_os_error() {
+         if raw == libc::EBUSY {
+             return true;
+@@ -40,6 +41,7 @@
+     if err.kind() == io::ErrorKind::WouldBlock {
+         return true;
+     }
++    #[cfg(any(unix, windows))]
+     if let Some(raw) = err.raw_os_error() {
+         if raw == libc::EBUSY {
+             return true;
+@@ -70,6 +72,10 @@
+ }
+ 
+ fn null_device() -> io::Result<std::fs::File> {
++    #[cfg(not(any(unix, windows)))]
++    {
++        Err(io::Error::new(io::ErrorKind::Unsupported, "no native null device"))
++    }
+     #[cfg(unix)]
+     {
+         std::fs::OpenOptions::new().write(true).open("/dev/null")
+diff --git a/grit-lib/src/lockfile.rs b/grit-lib/src/lockfile.rs
+--- a/grit-lib/src/lockfile.rs
++++ b/grit-lib/src/lockfile.rs
+@@ -641,6 +641,10 @@
+     if pid == 0 || pid > i32::MAX as u64 {
+         return false;
+     }
++    #[cfg(not(any(unix, windows)))]
++    {
++        false
++    }
+     #[cfg(windows)]
+     {
+         use windows_sys::Win32::Foundation::CloseHandle;
+diff --git a/grit-lib/src/refs/mod.rs b/grit-lib/src/refs/mod.rs
+--- a/grit-lib/src/refs/mod.rs
++++ b/grit-lib/src/refs/mod.rs
+@@ -774,8 +774,25 @@
+             true
+         }
+         io::ErrorKind::PermissionDenied => fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()),
++        #[cfg(any(unix, windows))]
+         _ => matches!(err.raw_os_error(), Some(libc::EISDIR | libc::ENOTDIR)),
+-    }
++        #[cfg(not(any(unix, windows)))]
++        _ => false,
++    }
++}
++
++fn has_native_enotdir(err: &io::Error) -> bool {
++    #[cfg(any(unix, windows))]
++    { err.raw_os_error() == Some(libc::ENOTDIR) }
++    #[cfg(not(any(unix, windows)))]
++    { let _ = err; false }
++}
++
++fn is_native_directory_removal_error(err: &io::Error) -> bool {
++    #[cfg(any(unix, windows))]
++    { matches!(err.raw_os_error(), Some(libc::EISDIR | libc::EPERM)) }
++    #[cfg(not(any(unix, windows)))]
++    { err.kind() == io::ErrorKind::IsADirectory }
+ }
+ 
+ /// Parse the content of a ref file (without trailing newline).
+@@ -3179,11 +3196,11 @@
+         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+         Err(e)
+             if e.kind() == io::ErrorKind::NotADirectory
+-                || e.raw_os_error() == Some(libc::ENOTDIR) => {}
++                || has_native_enotdir(&e) => {}
+         // The path is (still) a directory — e.g. a non-empty tree we declined to remove.
+         // Treat as "loose ref not present"; the packed-refs entry was already removed above.
+         Err(e)
+-            if e.raw_os_error() == Some(libc::EISDIR) || e.raw_os_error() == Some(libc::EPERM) => {}
++            if is_native_directory_removal_error(&e) => {}
+         Err(e) => return Err(Error::Io(e)),
+     }
+ 
+@@ -3313,7 +3330,7 @@
+         Err(e)
+             if e.kind() == io::ErrorKind::NotFound
+                 || e.kind() == io::ErrorKind::NotADirectory
+-                || e.raw_os_error() == Some(libc::ENOTDIR) =>
++                || has_native_enotdir(&e) =>
+         {
+             return Ok(removed);
+         }
+@@ -3805,7 +3822,7 @@
+         Err(e)
+             if e.kind() == io::ErrorKind::NotFound
+                 || e.kind() == io::ErrorKind::NotADirectory
+-                || e.raw_os_error() == Some(libc::ENOTDIR) =>
++                || has_native_enotdir(&e) =>
+         {
+             return Ok(());
+         }
+@@ -5164,7 +5181,7 @@
+         Err(e)
+             if e.kind() == io::ErrorKind::NotFound
+                 || e.kind() == io::ErrorKind::NotADirectory
+-                || e.raw_os_error() == Some(libc::ENOTDIR) =>
++                || has_native_enotdir(&e) =>
+         {
+             return Ok(());
+         }
+diff --git a/grit-lib/src/worktree/io_error.rs b/grit-lib/src/worktree/io_error.rs
+--- a/grit-lib/src/worktree/io_error.rs
++++ b/grit-lib/src/worktree/io_error.rs
+@@ -41,6 +41,7 @@
+     if err.kind() == io::ErrorKind::WouldBlock {
+         return true;
+     }
++    #[cfg(any(unix, windows))]
+     if let Some(raw) = err.raw_os_error() {
+         #[cfg(windows)]
+         if raw == 32 {

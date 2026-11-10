@@ -1,0 +1,610 @@
+//! Apply unified patches to the Git index (`git apply --cached` semantics).
+
+use super::blob_apply::{apply_patch_to_blob, BlobApplyOptions};
+use super::FilePatch;
+use crate::error::{ApplyError, Error};
+use crate::index::{Index, IndexEntry, MODE_REGULAR};
+use crate::merge_diff::read_blob_at_path;
+use crate::objects::{ObjectId, ObjectKind};
+use crate::repo::Repository;
+use std::collections::BTreeMap;
+
+/// Options for [`apply_patch_to_index`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexApplyOptions {
+    /// When true, validate and report paths without writing the index or objects.
+    pub dry_run: bool,
+    /// When true, reverse each patch before applying (`git apply --cached -R`).
+    pub reverse: bool,
+    /// When reversing, compare results to this tree to drop index entries that match `HEAD`.
+    pub head_tree_oid: Option<ObjectId>,
+}
+
+/// Result of applying patches to the index.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexApplyOutcome {
+    /// New paths added to the index.
+    pub added: Vec<String>,
+    /// Existing paths updated in the index.
+    pub modified: Vec<String>,
+    /// Paths removed from the index.
+    pub removed: Vec<String>,
+    /// Whether this was a dry run.
+    pub dry_run: bool,
+}
+
+impl IndexApplyOutcome {
+    fn push_added(&mut self, path: String) {
+        if !self.added.contains(&path) {
+            self.added.push(path);
+        }
+    }
+
+    fn push_modified(&mut self, path: String) {
+        if !self.modified.contains(&path) && !self.added.contains(&path) {
+            self.modified.push(path);
+        }
+    }
+
+    fn push_removed(&mut self, path: String) {
+        if !self.removed.contains(&path) {
+            self.removed.push(path);
+        }
+    }
+
+    fn finalize(mut self) -> Self {
+        self.added.sort();
+        self.modified.sort();
+        self.removed.sort();
+        self
+    }
+}
+
+#[derive(Clone)]
+enum PlannedChange {
+    Upsert {
+        path: String,
+        oid: ObjectId,
+        mode: u32,
+        blob: Vec<u8>,
+    },
+    Remove {
+        path: String,
+    },
+}
+
+/// Apply `patches` to `index` using index blobs as the preimage (never the worktree).
+///
+/// The operation is atomic: every patch is validated before any blob or index entry is written.
+pub fn apply_patch_to_index(
+    repo: &Repository,
+    index: &mut Index,
+    patches: &[FilePatch],
+    opts: &IndexApplyOptions,
+) -> std::result::Result<IndexApplyOutcome, ApplyError> {
+    // Later patches are planned against a copy that already has the earlier patches applied;
+    // the last (often only) patch needs no copy, since nothing is planned after it.
+    let mut trial: Option<Index> = None;
+    let mut outcome = IndexApplyOutcome {
+        dry_run: opts.dry_run,
+        ..IndexApplyOutcome::default()
+    };
+    let mut fn_table: BTreeMap<String, FnState> = BTreeMap::new();
+    let mut planned = Vec::new();
+
+    for (i, patch) in patches.iter().enumerate() {
+        if patch.involves_gitlink() {
+            let path = patch.effective_path().unwrap_or("<unknown>").to_string();
+            return Err(ApplyError::Failed {
+                path,
+                message: "submodule/gitlink patches are not supported".to_string(),
+            });
+        }
+        let view = trial.as_ref().unwrap_or(index);
+        let changes = plan_one_file_patch(repo, view, patch, opts, &mut fn_table, &mut outcome)?;
+        if i + 1 < patches.len() {
+            let trial = trial.get_or_insert_with(|| index.clone());
+            for change in &changes {
+                apply_planned_to_index(trial, change);
+            }
+        }
+        planned.extend(changes);
+    }
+
+    if !opts.dry_run {
+        for change in &planned {
+            if let PlannedChange::Upsert { blob, .. } = change {
+                repo.odb()
+                    .write(ObjectKind::Blob, blob)
+                    .map_err(|e| library_err_path("", e))?;
+            }
+        }
+        for change in &planned {
+            apply_planned_to_index(index, change);
+        }
+    }
+    Ok(outcome.finalize())
+}
+
+/// Load the index, apply `patches`, and commit the updated index under `.git/index.lock`.
+pub fn apply_patch_to_index_and_write(
+    repo: &Repository,
+    patches: &[FilePatch],
+    opts: &IndexApplyOptions,
+    cancel: &crate::progress::CancelToken,
+) -> std::result::Result<IndexApplyOutcome, ApplyError> {
+    let handle = repo.index();
+    let mut lock = handle
+        .begin_update()
+        .map_err(|e| library_err_path("", Error::from(e)))?;
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)
+        .map_err(|e| library_err_path("", e))?;
+    let mut index = handle
+        .load()
+        .map_err(|e| library_err_path("", Error::from(e)))?;
+    let outcome = apply_patch_to_index(repo, &mut index, patches, opts)?;
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)
+        .map_err(|e| library_err_path("", e))?;
+    if opts.dry_run {
+        return Ok(outcome);
+    }
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)
+        .map_err(|e| library_err_path("", e))?;
+    handle
+        .commit_update(&mut lock, &mut index, false)
+        .map_err(|e| library_err_path("", Error::from(e)))?;
+    Ok(outcome)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FnState {
+    Active,
+    Deleted,
+}
+
+fn plan_one_file_patch(
+    repo: &Repository,
+    index: &Index,
+    patch: &FilePatch,
+    opts: &IndexApplyOptions,
+    fn_table: &mut BTreeMap<String, FnState>,
+    outcome: &mut IndexApplyOutcome,
+) -> std::result::Result<Vec<PlannedChange>, ApplyError> {
+    let target = patch
+        .target_path()
+        .map(str::to_string)
+        .or_else(|| patch.effective_path().map(str::to_string))
+        .ok_or_else(|| ApplyError::Failed {
+            path: String::new(),
+            message: "patch has no target path".to_string(),
+        })?;
+
+    if patch.is_deleted {
+        if opts.reverse {
+            let base_blob = read_preimage_blob(repo, index, patch, &target, opts)?;
+            let new_blob = apply_patch_to_blob(
+                &base_blob,
+                patch,
+                &BlobApplyOptions {
+                    reverse: true,
+                    ..BlobApplyOptions::default()
+                },
+            )?;
+            return finish_reverse_index_upsert(
+                repo, index, patch, &target, opts, fn_table, outcome, new_blob,
+            );
+        }
+        let base_blob = read_preimage_blob(repo, index, patch, &target, opts)?;
+        apply_patch_to_blob(
+            &base_blob,
+            patch,
+            &BlobApplyOptions {
+                reverse: opts.reverse,
+                ..BlobApplyOptions::default()
+            },
+        )?;
+        if index.get(target.as_bytes(), 0).is_none() {
+            return Err(ApplyError::NotInIndex {
+                path: target.clone(),
+            });
+        }
+        fn_table.insert(target.clone(), FnState::Deleted);
+        outcome.push_removed(target.clone());
+        return Ok(vec![PlannedChange::Remove { path: target }]);
+    }
+
+    if patch.is_new
+        && index.get(target.as_bytes(), 0).is_some()
+        && fn_table.get(&target).copied() != Some(FnState::Deleted)
+    {
+        return Err(ApplyError::Failed {
+            path: target.clone(),
+            message: "path already exists in index".to_string(),
+        });
+    }
+
+    let base_blob = read_preimage_blob(repo, index, patch, &target, opts)?;
+    let new_blob = apply_patch_to_blob(
+        &base_blob,
+        patch,
+        &BlobApplyOptions {
+            reverse: opts.reverse,
+            ..BlobApplyOptions::default()
+        },
+    )?;
+    if opts.reverse {
+        return finish_reverse_index_upsert(
+            repo, index, patch, &target, opts, fn_table, outcome, new_blob,
+        );
+    }
+    let mode = resolve_mode(index, patch, &target)?;
+    let oid = hash_blob(repo, &new_blob)?;
+
+    let mut out = Vec::new();
+    if patch.is_rename {
+        if let Some(old) = patch.source_path().map(str::to_string) {
+            if old != target
+                && fn_table.get(&old).copied() != Some(FnState::Deleted)
+                && index.get(old.as_bytes(), 0).is_some()
+            {
+                fn_table.insert(old.clone(), FnState::Deleted);
+                outcome.push_removed(old.clone());
+                out.push(PlannedChange::Remove { path: old });
+            }
+        }
+    }
+
+    let existed = index.get(target.as_bytes(), 0).is_some()
+        || fn_table.get(&target).copied() == Some(FnState::Active);
+    if existed {
+        outcome.push_modified(target.clone());
+    } else {
+        outcome.push_added(target.clone());
+    }
+    fn_table.insert(target.clone(), FnState::Active);
+
+    out.push(PlannedChange::Upsert {
+        path: target,
+        oid,
+        mode,
+        blob: new_blob,
+    });
+    Ok(out)
+}
+
+fn apply_planned_to_index(index: &mut Index, change: &PlannedChange) {
+    match change {
+        PlannedChange::Remove { path } => {
+            index.remove_path_all_stages(path.as_bytes());
+        }
+        PlannedChange::Upsert {
+            path, oid, mode, ..
+        } => {
+            upsert_index_entry(index, path, *oid, *mode);
+        }
+    }
+}
+
+fn read_preimage_blob(
+    repo: &Repository,
+    index: &Index,
+    patch: &FilePatch,
+    target: &str,
+    opts: &IndexApplyOptions,
+) -> std::result::Result<Vec<u8>, ApplyError> {
+    if patch.is_new {
+        return Ok(Vec::new());
+    }
+    let path = patch
+        .source_path()
+        .or_else(|| patch.effective_path())
+        .unwrap_or(target);
+    if path == "/dev/null" {
+        return Ok(Vec::new());
+    }
+    if let Some(entry) = index.get(path.as_bytes(), 0) {
+        return repo
+            .odb()
+            .read(&entry.oid)
+            .map(|o| o.data)
+            .map_err(|e| ApplyError::Failed {
+                path: path.to_string(),
+                message: e.to_string(),
+            });
+    }
+    if opts.reverse {
+        return Ok(Vec::new());
+    }
+    Err(ApplyError::NotInIndex {
+        path: path.to_string(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_reverse_index_upsert(
+    repo: &Repository,
+    index: &Index,
+    patch: &FilePatch,
+    target: &str,
+    opts: &IndexApplyOptions,
+    fn_table: &mut BTreeMap<String, FnState>,
+    outcome: &mut IndexApplyOutcome,
+    new_blob: Vec<u8>,
+) -> std::result::Result<Vec<PlannedChange>, ApplyError> {
+    if should_drop_index_entry_on_reverse(repo, target, opts, &new_blob) {
+        if index.get(target.as_bytes(), 0).is_some()
+            || fn_table.get(target).copied() == Some(FnState::Active)
+        {
+            fn_table.insert(target.to_string(), FnState::Deleted);
+            outcome.push_removed(target.to_string());
+            return Ok(vec![PlannedChange::Remove {
+                path: target.to_string(),
+            }]);
+        }
+        return Ok(Vec::new());
+    }
+    let mode = resolve_mode(index, patch, target)?;
+    let oid = hash_blob(repo, &new_blob)?;
+    let existed = index.get(target.as_bytes(), 0).is_some()
+        || fn_table.get(target).copied() == Some(FnState::Active);
+    if existed {
+        outcome.push_modified(target.to_string());
+    } else {
+        outcome.push_added(target.to_string());
+    }
+    fn_table.insert(target.to_string(), FnState::Active);
+    Ok(vec![PlannedChange::Upsert {
+        path: target.to_string(),
+        oid,
+        mode,
+        blob: new_blob,
+    }])
+}
+
+fn should_drop_index_entry_on_reverse(
+    repo: &Repository,
+    path: &str,
+    opts: &IndexApplyOptions,
+    new_blob: &[u8],
+) -> bool {
+    if !new_blob.is_empty() {
+        return false;
+    }
+    let Some(tree) = opts.head_tree_oid else {
+        return true;
+    };
+    read_blob_at_path(repo.odb(), &tree, path).is_none()
+}
+
+fn resolve_mode(
+    index: &Index,
+    patch: &FilePatch,
+    target: &str,
+) -> std::result::Result<u32, ApplyError> {
+    if let Some(mode) = patch.new_mode.as_deref() {
+        return parse_mode(mode);
+    }
+    if patch.is_rename || patch.is_copy {
+        if let Some(src) = patch
+            .source_path()
+            .filter(|p| *p != "/dev/null")
+            .or_else(|| patch.old_path.as_deref().filter(|p| *p != "/dev/null"))
+        {
+            if let Some(entry) = index.get(src.as_bytes(), 0) {
+                return Ok(entry.mode);
+            }
+        }
+    }
+    if let Some(mode) = patch.old_mode.as_deref() {
+        return parse_mode(mode);
+    }
+    if let Some(entry) = index.get(target.as_bytes(), 0) {
+        return Ok(entry.mode);
+    }
+    Ok(MODE_REGULAR)
+}
+
+fn parse_mode(mode: &str) -> std::result::Result<u32, ApplyError> {
+    let trimmed = mode.trim();
+    u32::from_str_radix(trimmed, 8).map_err(|e| ApplyError::Failed {
+        path: String::new(),
+        message: format!("invalid mode '{trimmed}': {e}"),
+    })
+}
+
+fn hash_blob(repo: &Repository, data: &[u8]) -> std::result::Result<ObjectId, ApplyError> {
+    repo.odb()
+        .hash_algo()
+        .hash_object(ObjectKind::Blob, data)
+        .map_err(|e| ApplyError::Failed {
+            path: String::new(),
+            message: e.to_string(),
+        })
+}
+
+fn upsert_index_entry(index: &mut Index, path: &str, oid: ObjectId, mode: u32) {
+    let path_bytes = path.as_bytes().to_vec();
+    let flags = (path.len().min(0xfff) as u16) & 0x0fff;
+    let entry = IndexEntry {
+        ctime_sec: 0,
+        ctime_nsec: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        dev: 0,
+        ino: 0,
+        mode: if mode == 0 { MODE_REGULAR } else { mode },
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid,
+        flags,
+        flags_extended: None,
+        path: path_bytes,
+        base_index_pos: 0,
+    };
+    index.add_or_replace(entry);
+}
+
+fn library_err_path(path: &str, err: Error) -> ApplyError {
+    if matches!(err, Error::Cancelled) {
+        return ApplyError::Cancelled;
+    }
+    ApplyError::Failed {
+        path: path.to_string(),
+        message: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apply::parse_patch;
+    use crate::config::environment::RepositoryOptions;
+    use crate::repo::Repository;
+    use std::process::Command;
+
+    fn init_repo(dir: &std::path::Path) {
+        Command::new("git")
+            .current_dir(dir)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn index_apply_modify() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("f.txt"), b"a\n").unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "f.txt"])
+            .status()
+            .unwrap();
+        let patch = parse_patch(
+            "diff --git a/f.txt b/f.txt\n\
+             --- a/f.txt\n\
+             +++ b/f.txt\n\
+             @@ -1 +1 @@\n\
+             -a\n\
+             +b\n",
+            1,
+            "p",
+            false,
+            None,
+        )
+        .unwrap();
+        let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
+        let mut index = repo.index().load().unwrap();
+        apply_patch_to_index(&repo, &mut index, &patch, &IndexApplyOptions::default()).unwrap();
+        let entry = index.get(b"f.txt", 0).unwrap();
+        let blob = repo.odb().read(&entry.oid).unwrap();
+        assert_eq!(blob.data, b"b\n");
+        assert!(entry.stat_cache_unset());
+    }
+
+    fn one_line_patch(path: &str, old: &str, new: &str) -> FilePatch {
+        let text = format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{old}\n+{new}\n"
+        );
+        parse_patch(&text, 1, "p", false, None)
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    fn repo_with_index(files: &[(&str, &[u8])]) -> (tempfile::TempDir, Repository, Index) {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _) =
+            Repository::init(dir.path(), &crate::repo::InitOptions::default()).expect("init");
+        let mut index = Index::new();
+        for (path, data) in files {
+            let oid = repo.odb().write(ObjectKind::Blob, data).unwrap();
+            upsert_index_entry(&mut index, path, oid, MODE_REGULAR);
+        }
+        (dir, repo, index)
+    }
+
+    #[test]
+    fn apply_patch_to_index_and_write_cancelled_leaves_index_untouched() {
+        use crate::progress::CancelToken;
+        use std::fs;
+
+        let (_dir, repo, mut index) = repo_with_index(&[("f.txt", b"a\n")]);
+        repo.write_index(&mut index).expect("write index");
+        let before = fs::read(repo.index_path()).expect("read index");
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let patch = one_line_patch("f.txt", "a", "b");
+        let err =
+            apply_patch_to_index_and_write(&repo, &[patch], &IndexApplyOptions::default(), &cancel)
+                .expect_err("cancelled");
+        assert_eq!(err, ApplyError::Cancelled);
+        assert_eq!(fs::read(repo.index_path()).expect("read index"), before);
+    }
+
+    fn blob_at(repo: &Repository, index: &Index, path: &str) -> Vec<u8> {
+        let entry = index.get(path.as_bytes(), 0).expect("entry");
+        repo.odb().read(&entry.oid).unwrap().data
+    }
+
+    #[test]
+    fn index_apply_several_patches_in_one_call() {
+        let (_dir, repo, mut index) =
+            repo_with_index(&[("a.txt", b"a\n"), ("b.txt", b"b\n"), ("c.txt", b"c\n")]);
+        let patches = [
+            one_line_patch("a.txt", "a", "A"),
+            one_line_patch("c.txt", "c", "C"),
+        ];
+        let outcome =
+            apply_patch_to_index(&repo, &mut index, &patches, &IndexApplyOptions::default())
+                .unwrap();
+        assert_eq!(outcome.modified, ["a.txt", "c.txt"]);
+        assert_eq!(blob_at(&repo, &index, "a.txt"), b"A\n");
+        assert_eq!(blob_at(&repo, &index, "b.txt"), b"b\n");
+        assert_eq!(blob_at(&repo, &index, "c.txt"), b"C\n");
+    }
+
+    #[test]
+    fn index_apply_failure_in_later_patch_leaves_index_untouched() {
+        let (_dir, repo, mut index) = repo_with_index(&[("a.txt", b"a\n"), ("b.txt", b"b\n")]);
+        let before = index.clone();
+        let patches = [
+            one_line_patch("a.txt", "a", "A"),
+            one_line_patch("b.txt", "not-b", "B"),
+        ];
+        let err = apply_patch_to_index(&repo, &mut index, &patches, &IndexApplyOptions::default())
+            .expect_err("second patch does not apply");
+        assert!(matches!(err, ApplyError::PatchFailed { .. }), "{err:?}");
+        assert_eq!(index.entries, before.entries);
+        let a_oid = repo
+            .odb()
+            .hash_algo()
+            .hash_object(ObjectKind::Blob, b"A\n")
+            .unwrap();
+        assert!(!repo.odb().exists(&a_oid), "no blob written on failure");
+    }
+
+    #[test]
+    fn index_apply_dry_run_reports_without_changing_index() {
+        let (_dir, repo, mut index) = repo_with_index(&[("a.txt", b"a\n")]);
+        let before = index.clone();
+        let outcome = apply_patch_to_index(
+            &repo,
+            &mut index,
+            &[one_line_patch("a.txt", "a", "A")],
+            &IndexApplyOptions {
+                dry_run: true,
+                ..IndexApplyOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.modified, ["a.txt"]);
+        assert_eq!(index.entries, before.entries);
+    }
+}

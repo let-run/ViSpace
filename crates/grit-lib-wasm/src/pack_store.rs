@@ -1,0 +1,437 @@
+//! Repository-scoped pack and MIDX read caches.
+//!
+//! [`PackStore`] holds parsed pack indexes, pack file bytes, directory listings (with mtime
+//! signatures for reprepare-on-miss), multi-pack-index views, and the delta-base LRU. Each
+//! `objects/` directory gets its own store; [`crate::odb::Odb`] owns an [`Arc<PackStore>`]
+//! and installs it as thread-local context during [`Odb::read`](crate::odb::Odb::read).
+//! After repack or index-pack, call [`Odb::invalidate_packs`](crate::odb::Odb::invalidate_packs)
+//! on any handle for that repository so cached listings do not outlive removed pack files.
+//!
+//! When the last [`Arc`] to a [`PackStore`] is dropped, thread-local pack and index mappings
+//! for that store on the dropping thread are released so mmap-backed bytes do not accumulate.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use crate::test_support::pack_store::{
+    record_implicit_store_created, record_legacy_store_created,
+};
+
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) fn record_legacy_store_created() {}
+
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) fn record_implicit_store_created() {}
+
+/// Per-`objects/` cache of pack indexes, bytes, MIDX views, and delta-base LRU state.
+///
+/// [`crate::odb::Odb`] owns an [`Arc<PackStore>`]; [`Odb`](crate::odb::Odb) clones share it.
+/// Independently opened [`Odb`](crate::odb::Odb) handles for the same path get separate stores.
+/// Alternate object directories get separate stores retained on the parent [`Odb`](crate::odb::Odb).
+pub struct PackStore {
+    objects_dir: PathBuf,
+    /// Unique for the life of the process, so thread-local pack caches can tell stores apart:
+    /// a dropped store's address can be reused by a later store for the same directory.
+    id: u64,
+    /// Dropped with the last [`Arc`] to this store so thread-local pack caches release mmap state.
+    lifetime: Arc<()>,
+    pub(crate) sparse_read_files: crate::pack_map::SparseReadFiles,
+    bounded_reads: bool,
+    /// Bumped on every invalidation so other threads drop trusted thread-local pack caches.
+    cache_epoch: AtomicU64,
+    catalog: RwLock<crate::pack::pack_cache::CatalogState>,
+    delta_bases: crate::pack::pack_cache::ShardedDeltaBaseLru,
+    midx: Mutex<crate::midx::midx_cache::State>,
+    /// Repository-scoped config cache for MIDX chain parsing (paired with [`crate::odb::Odb`]).
+    repo_caches: RwLock<Option<Arc<crate::repo_caches::RepoCaches>>>,
+}
+
+/// Tree delta working set for an operation that reads scattered historical entries.
+pub(crate) const BOUNDED_DELTA_BASE_BYTES: usize = 16 * 1024 * 1024;
+
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<PackStore>;
+};
+
+/// Holds the active [`PackStore`] for this thread; suppresses TLS release while the slot drops.
+struct CurrentPackStore(Option<Arc<PackStore>>);
+
+impl Drop for CurrentPackStore {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::set_skip_store_tls_release(true);
+        self.0.take();
+    }
+}
+
+struct LegacyStoresByDir(HashMap<PathBuf, Arc<PackStore>>);
+
+impl Drop for LegacyStoresByDir {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::set_skip_store_tls_release(true);
+        self.0.clear();
+    }
+}
+
+struct ImplicitPackStore(Option<Arc<PackStore>>);
+
+impl Drop for ImplicitPackStore {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::set_skip_store_tls_release(true);
+        self.0.take();
+    }
+}
+
+// hygiene: scoped read contexts and legacy standalone caches must not cross threads
+thread_local! {
+    static CURRENT: RefCell<CurrentPackStore> = const { RefCell::new(CurrentPackStore(None)) };
+    static ACTIVE_OBJECTS_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// Standalone pack reads (no [`crate::odb::Odb`]) reuse one store per `objects/` on this thread.
+    static LEGACY_BY_DIR: RefCell<LegacyStoresByDir> =
+        RefCell::new(LegacyStoresByDir(HashMap::new()));
+    static IMPLICIT: RefCell<ImplicitPackStore> = const { RefCell::new(ImplicitPackStore(None)) };
+}
+
+impl PackStore {
+    /// Create a fresh store for `objects_dir` (not shared with other independent [`Odb`](crate::odb::Odb) opens).
+    #[must_use]
+    pub fn new(objects_dir: PathBuf) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            objects_dir,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            lifetime: Arc::new(()),
+            sparse_read_files: crate::pack_map::SparseReadFiles::default(),
+            bounded_reads: false,
+            cache_epoch: AtomicU64::new(0),
+            catalog: RwLock::new(crate::pack::pack_cache::CatalogState::default()),
+            delta_bases: crate::pack::pack_cache::ShardedDeltaBaseLru::new(),
+            midx: Mutex::new(crate::midx::midx_cache::State::default()),
+            repo_caches: RwLock::new(None),
+        }
+    }
+
+    /// Private cache for a random-access history operation. The pack catalog retains
+    /// at most 32 readers (descriptor and compressed windows together); active reads
+    /// retain their own handles until completion. Never changes a shared store.
+    pub(crate) fn for_bounded_reads(objects_dir: PathBuf) -> Self {
+        let mut store = Self::new(objects_dir);
+        store.bounded_reads = true;
+        store.delta_bases.set_byte_limit(BOUNDED_DELTA_BASE_BYTES);
+        store
+    }
+
+    pub(crate) fn bounded_reads(&self) -> bool {
+        self.bounded_reads
+    }
+
+    /// Share the open repository's config cache for pack/MIDX reads on this store.
+    pub(crate) fn set_repo_caches(&self, caches: Arc<crate::repo_caches::RepoCaches>) {
+        if let Ok(mut guard) = self.repo_caches.write() {
+            *guard = Some(caches);
+        }
+    }
+
+    fn repo_caches(&self) -> Option<Arc<crate::repo_caches::RepoCaches>> {
+        self.repo_caches
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(Arc::clone))
+    }
+
+    /// Config cache for MIDX reads against `objects_dir`, when opened via [`crate::odb::Odb`].
+    pub(crate) fn repo_caches_for_objects_dir(
+        objects_dir: &Path,
+    ) -> Option<Arc<crate::repo_caches::RepoCaches>> {
+        if Self::has_context() {
+            let store = Self::active_for_reads();
+            if store.objects_dir() == objects_dir {
+                return store.repo_caches();
+            }
+        }
+        LEGACY_BY_DIR.with(|map| {
+            map.borrow()
+                .0
+                .get(objects_dir)
+                .and_then(|store| store.repo_caches())
+        })
+    }
+
+    /// Like [`Self::repo_caches_for_objects_dir`] using a repository `config` path.
+    pub(crate) fn repo_caches_for_config_path(
+        config_path: &Path,
+    ) -> Option<Arc<crate::repo_caches::RepoCaches>> {
+        let git_dir = config_path.parent()?;
+        Self::repo_caches_for_objects_dir(&git_dir.join("objects"))
+    }
+
+    /// Process-unique id of this store (never 0).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn lifetime_weak(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.lifetime)
+    }
+
+    /// Generation counter incremented when pack caches are invalidated.
+    #[must_use]
+    pub(crate) fn cache_epoch(&self) -> u64 {
+        self.cache_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn bump_cache_epoch(&self) -> u64 {
+        self.cache_epoch.fetch_add(1, Ordering::Release) + 1
+    }
+
+    /// Pack catalog (indexes, bytes, directory listings) for this store.
+    pub(crate) fn with_catalog<R>(
+        &self,
+        f: impl FnOnce(&mut crate::pack::pack_cache::CatalogState) -> R,
+    ) -> R {
+        f(&mut self.catalog.write().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub(crate) fn with_catalog_read<R>(
+        &self,
+        f: impl FnOnce(&crate::pack::pack_cache::CatalogState) -> R,
+    ) -> R {
+        f(&self.catalog.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Like [`Self::with_catalog`], but skips `f` when the catalog write lock is contended.
+    pub(crate) fn try_with_catalog<R>(
+        &self,
+        f: impl FnOnce(&mut crate::pack::pack_cache::CatalogState) -> R,
+    ) -> Option<R> {
+        let mut guard = self.catalog.try_write().ok()?;
+        Some(f(&mut guard))
+    }
+
+    /// Sharded delta-base LRU (independent of the catalog mutex).
+    #[must_use]
+    pub(crate) fn delta_bases(&self) -> &crate::pack::pack_cache::ShardedDeltaBaseLru {
+        &self.delta_bases
+    }
+
+    /// Resolve the [`PackStore`] used for pack-cache reads on this thread.
+    pub(crate) fn active_for_reads() -> Arc<Self> {
+        if let Some(store) = CURRENT.with(|c| c.borrow().0.clone()) {
+            return store;
+        }
+        if let Some(dir) = ACTIVE_OBJECTS_DIR.with(|d| d.borrow().clone()) {
+            return Self::legacy_for_objects_dir(&dir);
+        }
+        IMPLICIT.with(|i| {
+            if let Some(s) = i.borrow().0.as_ref() {
+                return Arc::clone(s);
+            }
+            record_implicit_store_created();
+            let s = Arc::new(Self::new(PathBuf::from("__grit_implicit_pack_store")));
+            i.borrow_mut().0 = Some(Arc::clone(&s));
+            s
+        })
+    }
+
+    /// Legacy standalone reads: thread-local store for `objects_dir` (not shared with [`Odb`]).
+    pub(crate) fn legacy_for_objects_dir(objects_dir: &Path) -> Arc<Self> {
+        LEGACY_BY_DIR.with(|map| {
+            let key = objects_dir.to_path_buf();
+            if let Some(s) = map.borrow().0.get(&key) {
+                return Arc::clone(s);
+            }
+            record_legacy_store_created();
+            let store = Arc::new(Self::new(key.clone()));
+            map.borrow_mut().0.insert(key, Arc::clone(&store));
+            store
+        })
+    }
+
+    /// Store for pack reads under a standard `…/objects/pack/*.pack` path (legacy API only).
+    pub(crate) fn legacy_for_pack_path(pack_path: &Path) -> Arc<Self> {
+        let objects_dir = pack_path.parent().and_then(|pack_dir| {
+            (pack_dir.file_name() == Some(std::ffi::OsStr::new("pack")))
+                .then(|| pack_dir.parent())
+                .flatten()
+        });
+        match objects_dir {
+            Some(dir) => Self::legacy_for_objects_dir(dir),
+            None => IMPLICIT.with(|i| {
+                if let Some(s) = i.borrow().0.as_ref() {
+                    return Arc::clone(s);
+                }
+                record_implicit_store_created();
+                let s = Arc::new(Self::new(PathBuf::from("__grit_nonstandard_pack_cache")));
+                i.borrow_mut().0 = Some(Arc::clone(&s));
+                s
+            }),
+        }
+    }
+
+    /// `objects/` path for this store.
+    #[must_use]
+    pub fn objects_dir(&self) -> &Path {
+        &self.objects_dir
+    }
+
+    /// Whether this thread already has an active pack-read store context.
+    #[must_use]
+    pub fn has_context() -> bool {
+        CURRENT.with(|c| c.borrow().0.is_some())
+    }
+
+    /// Whether the active read context is scoped to `objects_dir`.
+    #[must_use]
+    pub(crate) fn read_context_matches_objects_dir(objects_dir: &Path) -> bool {
+        Self::has_context()
+            && ACTIVE_OBJECTS_DIR.with(|d| d.borrow().as_deref() == Some(objects_dir))
+    }
+
+    /// Run `f` with `store` as the pack-read context on this thread.
+    ///
+    /// Nested calls for the same store reuse the current context. Distinct store
+    /// handles remain isolated even when they name the same object directory.
+    pub fn with_context<R>(store: Arc<Self>, f: impl FnOnce() -> R) -> R {
+        if CURRENT.with(|current| {
+            current
+                .borrow()
+                .0
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &store))
+        }) {
+            return f();
+        }
+        let _guard = PackReadContextGuard::install(store);
+        f()
+    }
+
+    /// Drop cached pack listings, indexes, pack bytes, and delta bases.
+    pub fn invalidate_packs(&self) {
+        crate::pack::pack_cache::clear_catalog_on(&self.catalog);
+        self.delta_bases.clear();
+        self.sparse_read_files.clear();
+        let epoch = self.bump_cache_epoch();
+        crate::pack::pack_cache::drop_store_tls_snapshot(self.id());
+        crate::pack::pack_cache::clear_thread_local_after_invalidation(epoch);
+    }
+
+    /// Drop MIDX bytes and tip cache under this store's `objects/pack/`.
+    pub fn invalidate_midx(&self) {
+        crate::midx::midx_cache::evict_pack_dir_on(&self.midx, &self.objects_dir.join("pack"));
+    }
+
+    /// Full pack + MIDX invalidation (after repack/gc/index-pack in-process).
+    pub fn invalidate_all(&self) {
+        self.invalidate_packs();
+        self.invalidate_midx();
+    }
+
+    /// Apply `core.deltaBaseCacheLimit` from config to this store's delta-base LRU.
+    pub fn configure_delta_base_from_config(&self, cfg: Option<&crate::config::ConfigSet>) {
+        crate::pack::pack_cache::configure_delta_base_on(&self.delta_bases, cfg);
+    }
+
+    pub(crate) fn with_pack<R>(
+        &self,
+        f: impl FnOnce(&mut crate::pack::pack_cache::CatalogState) -> R,
+    ) -> R {
+        self.with_catalog(f)
+    }
+
+    pub(crate) fn with_midx<R>(
+        &self,
+        f: impl FnOnce(&mut crate::midx::midx_cache::State) -> R,
+    ) -> R {
+        f(&mut self.midx.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Run `f` on the store for the active read context (current store or legacy fallback).
+    pub(crate) fn with_current_or_implicit<R>(
+        f: impl FnOnce(&mut crate::pack::pack_cache::CatalogState) -> R,
+    ) -> R {
+        Self::active_for_reads().with_pack(f)
+    }
+
+    pub(crate) fn with_current_or_implicit_midx<R>(
+        f: impl FnOnce(&mut crate::midx::midx_cache::State) -> R,
+    ) -> R {
+        if let Some(store) = CURRENT.with(|c| c.borrow().0.clone()) {
+            return store.with_midx(f);
+        }
+        if let Some(dir) = ACTIVE_OBJECTS_DIR.with(|d| d.borrow().clone()) {
+            return Self::legacy_for_objects_dir(&dir).with_midx(f);
+        }
+        Self::active_for_reads().with_midx(f)
+    }
+
+    /// Clear legacy thread-local stores (tests/benches calling [`crate::pack::clear_pack_cache`]).
+    pub fn invalidate_all_legacy() {
+        LEGACY_BY_DIR.with(|map| {
+            for store in map.borrow().0.values() {
+                store.invalidate_all();
+            }
+            map.borrow_mut().0.clear();
+        });
+        IMPLICIT.with(|i| i.borrow_mut().0 = None);
+    }
+
+    /// Drop cached pack state for legacy standalone reads of `objects_dir`.
+    pub(crate) fn invalidate_legacy_for_objects_dir(objects_dir: &Path) {
+        LEGACY_BY_DIR.with(|map| {
+            if let Some(store) = map.borrow().0.get(objects_dir) {
+                store.invalidate_all();
+            }
+        });
+    }
+}
+
+impl Drop for PackStore {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::release_store_thread_local(self.id);
+    }
+}
+
+/// Keeps a thread-local pack read context alive for batch parallel reads.
+pub(crate) struct PackReadContextGuard {
+    prev_store: Option<Arc<PackStore>>,
+    prev_dir: Option<PathBuf>,
+}
+
+impl PackReadContextGuard {
+    pub(crate) fn install(store: Arc<PackStore>) -> Self {
+        let prev_store = CURRENT.with(|c| c.borrow_mut().0.replace(Arc::clone(&store)));
+        let prev_dir =
+            ACTIVE_OBJECTS_DIR.with(|d| d.borrow_mut().replace(store.objects_dir().to_path_buf()));
+        crate::pack::pack_cache::warm_thread_local_from_store(&store);
+        Self {
+            prev_store,
+            prev_dir,
+        }
+    }
+}
+
+impl Drop for PackReadContextGuard {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::clear_alternate_pack_read_store();
+        let bounded = CURRENT.with(|c| c.borrow().0.as_ref().is_some_and(|s| s.bounded_reads()));
+        if bounded {
+            // Operation-local pack bytes/indexes must not outlive their cache through
+            // thread-local fast paths, including when the allocator reuses a store address.
+            crate::pack::pack_cache::clear_thread_local_after_invalidation(0);
+            crate::pack::clear_pack_read_info_cache();
+        }
+        ACTIVE_OBJECTS_DIR.with(|d| *d.borrow_mut() = self.prev_dir.take());
+        let prev_store = self.prev_store.take();
+        CURRENT.with(|c| c.borrow_mut().0 = prev_store.clone());
+        if bounded {
+            return;
+        }
+        if let Some(store) = prev_store {
+            crate::pack::pack_cache::switch_tls_for_store(&store);
+        }
+    }
+}

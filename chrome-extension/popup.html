@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Supplier Purchase</title><link rel="stylesheet" href="popup.css"></head>
+<body><header><img src="icons/32.png" alt=""><div><h1>ViSpace</h1><small>LCSC / DigiKey / Mouser → Purchase</small></div></header>
+<details open><summary>Destinations</summary>
+<div class="destination-tabs" role="tablist" aria-label="Purchase destination">
+<button id="tab-web" type="button" role="tab" aria-controls="panel-web">Browser app</button>
+<button id="tab-http" type="button" role="tab" aria-controls="panel-http">Desktop · WebSocket</button>
+</div>
+<section id="panel-web" role="tabpanel" aria-labelledby="tab-web" hidden>
+<label>Browser app tab<select id="web-tab"><option value="">No app tab found</option></select></label>
+<button id="find-tabs" type="button">Refresh app tabs</button>
+<button id="discover-sync" type="button">Find nearby sync nodes</button>
+<label>Browser app URL<input id="web-url" type="url" placeholder="https://localhost:8787"></label>
+</section>
+<section id="panel-http" role="tabpanel" aria-labelledby="tab-http" hidden>
+<label>Desktop address<input id="address" type="url" placeholder="wss://127.0.0.1:8824"></label>
+</section>
+<button id="connect" type="button">Connect &amp; load projects</button></details>
+<button id="scrape">Read current product</button>
+<form id="purchase"><img id="preview" alt="Part photo" hidden><div id="fields"></div><label>Image URL<input id="image" type="url"></label><label>Purchase quantity<input id="quantity" type="number" min="1" step="1" value="1" required></label><fieldset><legend>Allocate to projects</legend><small>Each checked project needs a quantity. Total cannot exceed purchase quantity.</small><div id="projects">Connect to load projects.</div></fieldset><footer><p id="status" role="status" aria-live="polite"></p><button id="submit" type="submit" disabled>Add to Purchase</button></footer></form><script src="scrape.js"></script><script src="digikey.js"></script><script src="mouser.js"></script><script src="pricing.js"></script><script src="transport.js"></script><script src="popup.js"></script></body></html>

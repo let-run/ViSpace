@@ -1,0 +1,4737 @@
+//! Repository discovery and the primary `Repository` handle.
+//!
+//! # Discovery
+//!
+//! [`Repository::discover`] walks up from a starting directory to find the
+//! nearest `.git` directory (or bare repository), honouring `GIT_DIR` and
+//! `GIT_WORK_TREE` environment variables and the `.git` gitfile indirection.
+//!
+//! # Structure
+//!
+//! A [`Repository`] owns:
+//!
+//! - `git_dir` — absolute path to the `.git` directory (or the repo root for
+//!   bare repos).
+//! - `work_tree` — `Some(path)` for non-bare repos, `None` for bare.
+//! - [`Odb`] — the loose object database.
+//!
+//! Library guide: [repo](https://grit-scm.com/docs/library/repository)
+//!
+//! ```rust
+//! use grit_lib::repo::{InitOptions, Repository};
+//! # fn main() -> grit_lib::error::Result<()> {
+//! let dir = tempfile::tempdir()?;
+//! let (_repo, _outcome) = Repository::init(dir.path(), &InitOptions::default())?;
+//! # Ok(())
+//! # }
+//! ```
+
+use crate::git_path::CanonicalizeExt;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use crate::change_id::ChangeIdGenerator;
+use crate::command_runner::CommandRunner;
+use crate::config::{
+    config_file_stamps, stamp_for_path, ConfigCacheKey, ConfigFile, ConfigScope, ConfigSet,
+    LoadConfigOptions,
+};
+use crate::diagnostics::{self, DiagnosticsHandle};
+use crate::environment::{Environment, RepositoryOptions};
+use crate::error::{ConfigError, Error, NotARepositoryReason, Result};
+use crate::git_dir::io_error::{map_git_dir_io, map_index_write_error, GitDirPathOperation};
+use crate::git_path::path_for_error_message;
+use crate::hooks::run_hook;
+use crate::index::{Index, IndexError, IndexResult};
+use crate::init_filesystem::{apply_init_filesystem_config, InitFilesystemConfigOptions};
+use crate::objects::{parse_commit, CommitData, HashAlgo, ObjectId, ObjectKind};
+use crate::odb::Odb;
+use crate::refs::store::{RefName, RefNameRef};
+use crate::repo_caches::RepoCaches;
+use crate::rev_parse::is_inside_work_tree;
+use crate::sparse_checkout::effective_cone_mode_for_sparse_file;
+use crate::split_index::{write_index_file_split, WriteSplitIndexRequest};
+use crate::worktree::io_error::{map_worktree_io, WorktreePathOperation};
+use crate::worktree_cwd::cwd_relative_under_work_tree;
+
+/// Compute Git `GIT_PREFIX` for `env.cwd` relative to the work tree (POSIX, no trailing `/`).
+fn compute_git_prefix(env: &Environment, work_tree: &Path) -> Option<String> {
+    if let Some(prefix) = env.git_prefix.as_deref() {
+        let p = prefix.trim();
+        if !p.is_empty() {
+            return Some(p.to_owned());
+        }
+    }
+    let rel = cwd_relative_under_work_tree(work_tree, &env.cwd)?;
+    if rel.is_empty() {
+        None
+    } else {
+        Some(rel)
+    }
+}
+
+fn read_sparse_checkout_patterns(git_dir: &Path) -> Vec<String> {
+    let path = git_dir.join("info").join("sparse-checkout");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+/// Provenance flags recorded when a repository is discovered or opened explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryInfo {
+    /// Opened via `GIT_DIR` or an explicit git directory (not upward discovery).
+    pub explicit_git_dir: bool,
+    /// Directory where `.git` / a gitfile was found during upward discovery.
+    pub discovery_root: Option<PathBuf>,
+    /// `GIT_WORK_TREE` was applied after discovery without `GIT_DIR`.
+    pub work_tree_from_env: bool,
+    /// Discovery encountered a `.git` gitfile rather than a directory.
+    pub discovery_via_gitfile: bool,
+}
+
+/// Result of [`Repository::init`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitOutcome {
+    /// `true` when an existing repository was reinitialized in place.
+    pub reinitialized: bool,
+    /// Branch name recorded in `HEAD` after init (existing branch on reinit).
+    pub initial_branch: String,
+}
+
+/// Options for [`Repository::init`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct InitOptions {
+    /// Create a bare repository at `path` instead of `path/.git`.
+    pub bare: bool,
+    /// Initial branch name written into `HEAD` when creating a new repository.
+    ///
+    /// When `None`, [`resolve_initial_branch`] reads `init.defaultBranch` from the
+    /// configuration cascade (without the new repository's local config) and falls
+    /// back to `main`. Ignored on reinit (existing `HEAD` is kept).
+    pub initial_branch: Option<String>,
+    /// Optional template directory (empty path skips hook installation).
+    pub template_dir: Option<PathBuf>,
+    /// Ref storage backend for the new repository.
+    pub ref_storage: crate::ref_storage::RefStorageFormat,
+    /// When set, place the git directory here and link from `path` via a gitfile.
+    pub separate_git_dir: Option<PathBuf>,
+    /// Bare git directory with `core.worktree` pointing at `path` (`GIT_WORK_TREE` clone layout).
+    pub bare_with_worktree_at_path: bool,
+    /// Object hash algorithm for a new repository (`extensions.objectformat`).
+    ///
+    /// When `None`, new repositories default to SHA-1; reinit preserves the existing format.
+    pub object_format: Option<HashAlgo>,
+    /// Environment used to resolve `init.defaultBranch` and other init-time config, and stored
+    /// on the returned [`Repository`] when set (identity, `core.autocrlf`, `safe.directory`, and
+    /// related cascade). When `None`, init uses [`Environment::empty`] and the handle stays
+    /// hermetic like [`RepositoryOptions::empty`].
+    pub environment: Option<Environment>,
+    /// Init-time filesystem probes (`InitFilesystemConfigOptions`).
+    pub init_filesystem: InitFilesystemConfigOptions,
+}
+
+impl Default for InitOptions {
+    fn default() -> Self {
+        Self {
+            bare: false,
+            initial_branch: None,
+            template_dir: None,
+            ref_storage: crate::ref_storage::RefStorageFormat::Files,
+            separate_git_dir: None,
+            bare_with_worktree_at_path: false,
+            object_format: None,
+            environment: None,
+            init_filesystem: InitFilesystemConfigOptions::default(),
+        }
+    }
+}
+
+impl InitOptions {
+    /// Same as [`Default::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set [`Self::bare`].
+    #[must_use]
+    pub fn with_bare(mut self, bare: bool) -> Self {
+        self.bare = bare;
+        self
+    }
+
+    /// Set [`Self::initial_branch`].
+    #[must_use]
+    pub fn with_initial_branch(mut self, initial_branch: impl Into<String>) -> Self {
+        self.initial_branch = Some(initial_branch.into());
+        self
+    }
+
+    /// Set [`Self::object_format`].
+    #[must_use]
+    pub fn with_object_format(mut self, object_format: HashAlgo) -> Self {
+        self.object_format = Some(object_format);
+        self
+    }
+
+    /// Set [`Self::environment`].
+    #[must_use]
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
+        self
+    }
+
+    /// Set [`Self::init_filesystem`] (for example [`PrecomposeDetection::Always`](crate::init_filesystem::PrecomposeDetection::Always) on Linux CI).
+    #[must_use]
+    pub fn with_init_filesystem(mut self, init_filesystem: InitFilesystemConfigOptions) -> Self {
+        self.init_filesystem = init_filesystem;
+        self
+    }
+
+    /// Set [`Self::ref_storage`].
+    #[must_use]
+    pub fn with_ref_storage(mut self, ref_storage: crate::ref_storage::RefStorageFormat) -> Self {
+        self.ref_storage = ref_storage;
+        self
+    }
+
+    /// Set [`Self::template_dir`].
+    #[must_use]
+    pub fn with_template_dir(mut self, template_dir: Option<PathBuf>) -> Self {
+        self.template_dir = template_dir;
+        self
+    }
+
+    /// Set [`Self::separate_git_dir`].
+    #[must_use]
+    pub fn with_separate_git_dir(mut self, separate_git_dir: Option<PathBuf>) -> Self {
+        self.separate_git_dir = separate_git_dir;
+        self
+    }
+
+    /// Set [`Self::bare_with_worktree_at_path`].
+    #[must_use]
+    pub fn with_bare_with_worktree_at_path(mut self, bare_with_worktree_at_path: bool) -> Self {
+        self.bare_with_worktree_at_path = bare_with_worktree_at_path;
+        self
+    }
+}
+
+/// Point `HEAD` at `refs/heads/<branch>` in `store` unless `HEAD` already exists.
+fn seed_unborn_head(store: &dyn crate::refs::store::RefStore, branch: &str) -> Result<()> {
+    use crate::refs::store::{Expected, RawRef, RefStoreError, RefTransaction, RefUpdate};
+
+    RefName::branch(branch).map_err(|e| Error::InvalidRef(e.to_string()))?;
+    if store.read_raw(RefNameRef::from_trusted("HEAD"))?.is_some() {
+        return Ok(());
+    }
+    let txn = RefTransaction::new().update(RefUpdate {
+        name: RefName::from_trusted("HEAD"),
+        new_value: Some(RawRef::Symbolic(format!("refs/heads/{branch}"))),
+        expected: Expected::Missing,
+        reflog: None,
+        flags: crate::refs::store::RefUpdateFlags {
+            no_deref: true,
+            ..Default::default()
+        },
+    })?;
+    match store.prepare(txn).and_then(|prepared| prepared.commit()) {
+        Ok(()) | Err(RefStoreError::ExpectedMismatch { .. }) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// A handle to an open Git repository.
+///
+/// ## Config and path caching
+///
+/// On open, Grit resolves the common git directory ([`Self::common_git_dir`]), loads the merged
+/// configuration cascade once, and keeps that snapshot for the lifetime of this handle. Hot paths
+/// (object reads, replace-ref checks, and similar) reuse the snapshot without re-statting config
+/// files on every access.
+///
+/// Refresh the snapshot when on-disk config may have changed:
+///
+/// - [`Self::reload_config`] after writing config through [`crate::config::Config`] or other
+///   in-process library APIs on this handle.
+/// - Hook and filter subprocesses may rewrite config; [`crate::hooks::run_hook_opts`] reloads the
+///   snapshot after hooks finish when a [`Repository`] is provided.
+/// - External edits (another process, or the system `git` binary) are picked up on the next
+///   [`Self::config`] call, which revalidates file stamps once per call—not on every internal read.
+/// - Open a new [`Repository`] to observe ref or config changes made elsewhere without calling
+///   [`Self::reload_config`] (for example a `refs/replace/*` ref created by system `git`).
+///
+/// # Examples
+///
+/// ```
+/// use grit_lib::prelude::RepositoryOptions;
+/// use grit_lib::repo::{InitOptions, Repository};
+///
+/// # fn main() -> grit_lib::error::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let (repo, _outcome) = Repository::init(dir.path(), &InitOptions::default())?;
+/// let reopened = Repository::open(
+///     repo.git_dir(),
+///     &RepositoryOptions::empty().with_work_tree(dir.path()),
+/// )?;
+/// assert_eq!(reopened.git_dir(), repo.git_dir());
+/// # Ok(())
+/// # }
+/// ```
+pub struct Repository {
+    git_dir: PathBuf,
+    /// Common git directory (`commondir` target when linked; otherwise [`Self::git_dir`]).
+    common_git_dir: PathBuf,
+    work_tree: Option<PathBuf>,
+    odb: Odb,
+    explicit_git_dir: bool,
+    discovery_root: Option<PathBuf>,
+    work_tree_from_env: bool,
+    discovery_via_gitfile: bool,
+    /// Session config snapshot and derived hot-path flags (see struct-level rustdoc).
+    config_session: Mutex<Option<ConfigSession>>,
+    /// Repository-scoped caches (config, attributes, filters, precompose, …).
+    caches: Arc<RepoCaches>,
+    /// Pluggable ref backend selected for this repository, checked against [`Self::odb`].
+    refs_backend: crate::refs::store::ObjectCheckedRefStore,
+    /// Discovery and configuration environment used to open this repository.
+    environment: Arc<Environment>,
+    /// Repository-relative path of [`Environment::cwd`] under [`Self::work_tree`] (Git `GIT_PREFIX`).
+    git_prefix: Option<String>,
+    /// Injectable subprocess runner (hooks, filters, helpers).
+    command_runner: Arc<dyn CommandRunner>,
+    /// Injectable random bytes for new change ids.
+    change_id_generator: Arc<dyn ChangeIdGenerator>,
+    diagnostics: DiagnosticsHandle,
+    network_trace: bool,
+    /// Embedder override for rev-parse relative dates (`@{yesterday}`, etc.).
+    reference_unix_time: Option<i64>,
+    ownership_check: Arc<dyn crate::ownership_check::OwnershipCheck>,
+    thread_policy: crate::parallel::ThreadPolicy,
+    hook_stdio: crate::hooks::HookStdio,
+}
+
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<Repository>;
+};
+
+impl std::fmt::Debug for Repository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Repository")
+            .field("git_dir", &self.git_dir())
+            .field("work_tree", &self.work_tree())
+            .field("explicit_git_dir", &self.discovery_info().explicit_git_dir)
+            .field("network_trace", &self.network_trace)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Legacy alias kept for [`Odb`] wiring during the repository-cache migration.
+pub(crate) type RepositoryConfigSnapshot = Arc<RepoCaches>;
+
+/// Repository-level settings derived from config that are read on hot paths.
+#[derive(Debug, Clone)]
+struct RepoCachedSettings {
+    /// `core.useReplaceRefs` (default `true`).
+    use_replace_refs: bool,
+    /// Effective `refs/replace/` base path (always slash-terminated).
+    replace_ref_base: String,
+}
+
+/// Stamp metadata for one loaded config cascade (session invalidation).
+#[derive(Clone)]
+struct ConfigSessionValidation {
+    key: ConfigCacheKey,
+    env_fingerprint: Vec<(String, Option<String>)>,
+    base_stamps: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    extra_stamps: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    /// The environment snapshot the stamps were last validated against. While the handle
+    /// still uses this very snapshot (and git dir), the fingerprint, cache key and cascade
+    /// paths cannot have changed, so validation only re-stats the stamped files.
+    environment: Arc<Environment>,
+}
+
+/// In-memory config session for one open [`Repository`] handle.
+struct ConfigSession {
+    config: Arc<ConfigSet>,
+    validation: ConfigSessionValidation,
+    cached_settings: RepoCachedSettings,
+    /// When `true`, [`Repository::resolve_replace_redirect`] skips replace-ref lookups.
+    replace_lookup_inactive: bool,
+}
+
+impl ConfigSessionValidation {
+    /// Whether the session's cascade still matches `env`, `git_dir` and the files on disk.
+    ///
+    /// `opts` builds the load options of the handle (always the same for one environment
+    /// and git dir); it is only called when `env` is not the snapshot last validated. A
+    /// full check that passes adopts `env` as that snapshot.
+    fn still_valid(
+        &mut self,
+        env: &Arc<Environment>,
+        git_dir: &Path,
+        opts: impl FnOnce() -> LoadConfigOptions,
+    ) -> bool {
+        if Arc::ptr_eq(env, &self.environment) && self.key.git_dir.as_deref() == Some(git_dir) {
+            return stamps_unchanged(&self.base_stamps) && stamps_unchanged(&self.extra_stamps);
+        }
+        let opts = &opts();
+        let Some(env_fp) = env.config_fingerprint() else {
+            return false;
+        };
+        if self.env_fingerprint.as_slice() != env_fp.as_slice() {
+            return false;
+        }
+        let key = ConfigCacheKey::new(Some(git_dir), opts);
+        if key != self.key {
+            return false;
+        }
+        let base_stamps = config_file_stamps(env, Some(git_dir), opts);
+        if self.base_stamps.as_slice() != base_stamps.as_slice()
+            || !stamps_unchanged(&self.extra_stamps)
+        {
+            return false;
+        }
+        self.environment = Arc::clone(env);
+        true
+    }
+}
+
+fn stamps_unchanged(stamps: &[(PathBuf, Option<(std::time::SystemTime, u64)>)]) -> bool {
+    stamps
+        .iter()
+        .all(|(path, stamp)| stamp_for_path(path) == *stamp)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checked_ref_store_with_hooks(
+    inner: Arc<dyn crate::refs::store::RefStore>,
+    odb: crate::odb::Odb,
+    git_dir: &Path,
+    work_tree: Option<&Path>,
+    environment: &Arc<Environment>,
+    command_runner: &Arc<dyn CommandRunner>,
+    hook_stdio: crate::hooks::HookStdio,
+    diagnostics: &crate::diagnostics::DiagnosticsHandle,
+) -> crate::refs::store::ObjectCheckedRefStore {
+    let hooks = Arc::new(crate::hooks::RefHookContext::new(
+        git_dir.to_path_buf(),
+        work_tree.map(Path::to_path_buf),
+        Arc::clone(environment),
+        Arc::clone(command_runner),
+        hook_stdio,
+        Arc::clone(diagnostics),
+        odb.hash_algo(),
+    ));
+    crate::refs::store::ObjectCheckedRefStore::new(inner, odb).with_ref_hooks(hooks)
+}
+
+impl Repository {
+    fn config_load_options(&self, include_system: bool) -> LoadConfigOptions {
+        LoadConfigOptions {
+            include_system,
+            diagnostics: Some(self.diagnostics()),
+            ..crate::config::LoadConfigOptions::for_repository(
+                &self.environment,
+                Some(&self.git_dir),
+                Some(Arc::clone(&self.caches)),
+            )
+        }
+    }
+
+    fn from_canonical_git_dir(
+        options: &RepositoryOptions,
+        git_dir: PathBuf,
+        work_tree: Option<&Path>,
+        injected_refs: Option<Arc<dyn crate::refs::store::RefStore>>,
+    ) -> Result<Self> {
+        let environment = Arc::new(options.environment.clone());
+        let command_runner = Arc::clone(&options.command_runner);
+        let change_id_generator = Arc::clone(&options.change_id_generator);
+        // An injected ref store holds HEAD itself; otherwise HEAD must exist or be a symlink
+        // (linked worktrees have a symlink HEAD).
+        if injected_refs.is_none() && !head_file_present(&git_dir) {
+            return Err(not_a_repository_at(&git_dir));
+        }
+
+        let common_git_dir = resolve_common_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
+        let objects_dir = resolve_objects_dir(&environment, &git_dir, &common_git_dir)
+            .filter(|dir| dir.exists())
+            .ok_or_else(|| not_a_repository_at(&git_dir))?;
+
+        let work_tree = match work_tree {
+            Some(p) => {
+                let cwd = environment.discovery_cwd();
+                let mut resolved = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    cwd.join(p)
+                };
+                if resolved.exists() {
+                    resolved = resolved
+                        .canonicalize_simplified()
+                        .map_err(|_| Error::PathError(p.display().to_string()))?;
+                }
+                Some(resolved)
+            }
+            None => None,
+        };
+
+        let caches = RepoCaches::with_diagnostics(
+            Arc::clone(&command_runner),
+            Arc::clone(&options.diagnostics),
+            options.reftable_write,
+        );
+        caches.set_promisor_fetcher(options.promisor_fetcher.clone());
+        let odb = if let Some(ref wt) = work_tree {
+            Odb::with_work_tree(&objects_dir, wt)
+                .with_config_git_dir(git_dir.clone())
+                .with_shared_config_state(caches.clone(), environment.clone())
+        } else {
+            Odb::new(&objects_dir)
+                .with_config_git_dir(git_dir.clone())
+                .with_shared_config_state(caches.clone(), environment.clone())
+        };
+
+        let git_prefix = work_tree
+            .as_ref()
+            .and_then(|wt| compute_git_prefix(environment.as_ref(), wt));
+
+        let refs_backend = checked_ref_store_with_hooks(
+            open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?,
+            odb.clone(),
+            &git_dir,
+            work_tree.as_deref(),
+            &environment,
+            &command_runner,
+            options.hook_stdio,
+            &options.diagnostics,
+        );
+        caches.configure_filter_subprocess(&environment, &git_dir, work_tree.as_deref());
+
+        Ok(Self {
+            git_dir,
+            common_git_dir,
+            work_tree,
+            odb,
+            explicit_git_dir: false,
+            discovery_root: None,
+            work_tree_from_env: false,
+            discovery_via_gitfile: false,
+            config_session: Mutex::new(None),
+            caches,
+            refs_backend,
+            environment,
+            git_prefix,
+            command_runner,
+            change_id_generator,
+            diagnostics: Arc::clone(&options.diagnostics),
+            network_trace: options.network_trace,
+            reference_unix_time: options.reference_unix_time,
+            ownership_check: options.ownership_check(),
+            thread_policy: options.thread_policy,
+            hook_stdio: options.hook_stdio,
+        })
+    }
+
+    /// Explicit parallel worker overrides for this handle (`--threads` / embedder policy).
+    #[must_use]
+    pub fn thread_policy(&self) -> crate::parallel::ThreadPolicy {
+        self.thread_policy
+    }
+
+    /// Return a copy of this repository handle with an updated parallel thread policy.
+    #[must_use]
+    pub fn with_thread_policy(mut self, policy: crate::parallel::ThreadPolicy) -> Self {
+        self.thread_policy = policy;
+        self
+    }
+
+    /// Return this handle's shared cache arena.
+    #[must_use]
+    pub(crate) fn caches(&self) -> &Arc<RepoCaches> {
+        &self.caches
+    }
+
+    /// Return the promisor hydration hook for this repository, if installed.
+    #[must_use]
+    pub(crate) fn promisor_hydrate_hook(&self) -> Option<crate::blame::PromisorHydrateHook> {
+        self.caches.promisor_hydrate_hook()
+    }
+
+    /// Return the [`Environment`] used to discover or open this repository.
+    #[must_use]
+    pub fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
+    /// Unix timestamp for rev-parse relative date selectors (`@{yesterday}`, etc.).
+    #[must_use]
+    pub fn reference_unix_time(&self) -> i64 {
+        self.wall_clock_epoch()
+    }
+
+    /// Wall clock used for commit dates, rerere GC, relative dates, and similar operations on this handle.
+    #[must_use]
+    pub fn wall_clock_epoch(&self) -> i64 {
+        if let Some(ts) = self.reference_unix_time {
+            return ts;
+        }
+        if let Some(ts) = self.environment.git_now_date_override() {
+            return ts;
+        }
+        crate::git_date::tm::process_wall_clock_sec()
+    }
+
+    /// [`Self::wall_clock_epoch`] in this handle's `TZ`, for stamping author, committer and
+    /// reflog identity lines (see
+    /// [`resolve_identity_with`](crate::config::ident_resolve::resolve_identity_with)).
+    #[must_use]
+    pub fn identity_now(&self) -> time::OffsetDateTime {
+        crate::environment::offset_from_epoch_and_tz(
+            self.wall_clock_epoch(),
+            self.environment.tz.as_deref(),
+        )
+    }
+
+    /// Resolve the author or committer identity Git would record for a new commit, tag, stash,
+    /// or notes commit made through this handle.
+    ///
+    /// Reads the handle's [`Environment`] (`GIT_AUTHOR_*` / `GIT_COMMITTER_*`, including the
+    /// `*_DATE` overrides) and configuration (`author.*`, `committer.*`, `user.*`); see
+    /// [`resolve_signature_with`](crate::config::ident_resolve::resolve_signature_with).
+    ///
+    /// # Parameters
+    ///
+    /// - `role`: author or committer.
+    /// - `now`: timestamp recorded when no date override is set; usually [`Self::identity_now`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Identity`] when no usable name, email, or date is configured, and config load
+    /// failures.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grit_lib::config::ident_resolve::IdentRole;
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _outcome) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// match repo.identity(IdentRole::Author, repo.identity_now()) {
+    ///     Ok(author) => assert!(!author.email.is_empty()),
+    ///     Err(grit_lib::error::Error::Identity(_)) => {} // nothing configured
+    ///     Err(other) => return Err(other),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn identity(
+        &self,
+        role: crate::config::ident_resolve::IdentRole,
+        now: time::OffsetDateTime,
+    ) -> Result<crate::ident::Signature> {
+        let config = self.config().snapshot()?;
+        Ok(crate::config::ident_resolve::resolve_signature_with(
+            self.environment(),
+            &config,
+            role,
+            now,
+        )?)
+    }
+
+    /// Subprocess runner used for hooks, filters, and helpers.
+    #[must_use]
+    pub fn command_runner(&self) -> Arc<dyn CommandRunner> {
+        Arc::clone(&self.command_runner)
+    }
+
+    /// Where hooks run through this handle write their output
+    /// ([`RepositoryOptions::with_hook_stdio`]).
+    #[must_use]
+    pub fn hook_stdio(&self) -> crate::hooks::HookStdio {
+        self.hook_stdio
+    }
+
+    /// Generator used for random change ids on new commits.
+    #[must_use]
+    pub fn change_id_generator(&self) -> Arc<dyn ChangeIdGenerator> {
+        Arc::clone(&self.change_id_generator)
+    }
+
+    /// [`RepositoryOptions`] for discovering a linked worktree of this repository.
+    #[must_use]
+    pub(crate) fn linked_worktree_discover_options(&self) -> RepositoryOptions {
+        let mut environment = (*self.environment).clone();
+        environment.git_dir = None;
+        environment.git_work_tree = None;
+        environment.git_index_file = None;
+        environment.git_prefix = None;
+        environment.git_object_directory = None;
+        RepositoryOptions {
+            environment,
+            command_runner: Arc::clone(&self.command_runner),
+            change_id_generator: Arc::clone(&self.change_id_generator),
+            diagnostics: Arc::clone(&self.diagnostics),
+            network_trace: self.network_trace,
+            ownership_check: Arc::clone(&self.ownership_check),
+            reference_unix_time: self.reference_unix_time,
+            thread_policy: self.thread_policy,
+            work_tree: None,
+            odb_builder: None,
+            ref_store: None,
+            initial_branch: None,
+            validate_repository_format: true,
+            open_for_serving: false,
+            promisor_fetcher: self.caches().promisor_fetcher(),
+            hook_stdio: self.hook_stdio,
+            reftable_write: self.caches.reftable_write(),
+        }
+    }
+
+    /// [`RepositoryOptions`] for opening another repository on this machine as the far end of
+    /// a local transfer, such as the destination of a local-path or `file://` push.
+    ///
+    /// Keeps the caller's environment (so that repository's hook scripts see the same `PATH`
+    /// and `HOME`, and global config applies), command runner and diagnostics, but drops the
+    /// variables that describe only this repository: its location, index and object
+    /// directories, `GIT_CONFIG`, command-line config overrides, namespace and replace-ref
+    /// settings. Git clears the same set before starting the far end of its local transport.
+    #[must_use]
+    pub(crate) fn peer_repository_options(&self) -> RepositoryOptions {
+        let mut options = self.linked_worktree_discover_options();
+        let env = &mut options.environment;
+        env.git_alternate_object_directories = None;
+        env.git_namespace = None;
+        env.git_replace_ref_base = None;
+        env.git_no_replace_objects = false;
+        env.git_config = None;
+        env.git_config_parameters = None;
+        env.git_config_count = None;
+        env.git_config_pairs.clear();
+        options
+    }
+
+    /// Handle for the linked worktree administered at `admin_dir` with its files at
+    /// `work_tree`.
+    ///
+    /// `admin_dir` is the worktree's directory under `<common git dir>/worktrees/`
+    /// ([`crate::worktree::WorktreeEntry::admin_dir`]). When both stores live in the git
+    /// directory the linked worktree is discovered from `work_tree`, as any later open would.
+    /// Otherwise discovery could not find an injected store, so the handle shares this
+    /// handle's object store and refs, except that `HEAD` and the `HEAD` reflog are the
+    /// worktree's own, in `admin_dir/HEAD` and `admin_dir/logs/HEAD`: commits and checkouts
+    /// made through the handle move the branch that `HEAD` names, never the main worktree's.
+    ///
+    /// # Errors
+    ///
+    /// Discovery failures, [`RepositoryError::NotARepository`] when `admin_dir` is missing, and
+    /// [`Error::PathError`] when `work_tree` cannot be canonicalized.
+    pub(crate) fn open_linked_worktree(&self, admin_dir: &Path, work_tree: &Path) -> Result<Self> {
+        let options = self.linked_worktree_discover_options();
+        if self.refs_on_disk() && self.odb.uses_files_primary() {
+            return Self::discover(Some(work_tree), &options);
+        }
+        let git_dir = admin_dir
+            .canonicalize_simplified()
+            .map_err(|_| not_a_repository_at(admin_dir))?;
+        let work_tree = work_tree
+            .canonicalize_simplified()
+            .map_err(|_| Error::PathError(work_tree.display().to_string()))?;
+        let environment = Arc::new(options.environment);
+        let caches = RepoCaches::with_diagnostics(
+            Arc::clone(&self.command_runner),
+            Arc::clone(&self.diagnostics),
+            self.caches.reftable_write(),
+        );
+        let ref_store = if self.refs_on_disk() {
+            caches.open_ref_store(&git_dir, &environment)?
+        } else {
+            let view: Arc<dyn crate::refs::store::RefStore> =
+                Arc::new(crate::refs::store::LinkedWorktreeRefStore::new(
+                    git_dir.clone(),
+                    Arc::clone(self.refs_backend.inner()),
+                ));
+            caches.install_ref_store(&git_dir, Arc::clone(&view));
+            view
+        };
+        let refs_backend = checked_ref_store_with_hooks(
+            ref_store,
+            self.odb.clone(),
+            &git_dir,
+            Some(work_tree.as_path()),
+            &environment,
+            &self.command_runner,
+            self.hook_stdio,
+            &self.diagnostics,
+        );
+        let repo = Self {
+            git_prefix: compute_git_prefix(&environment, &work_tree),
+            git_dir,
+            common_git_dir: self.common_git_dir.clone(),
+            work_tree: Some(work_tree),
+            odb: self.odb.clone(),
+            explicit_git_dir: false,
+            discovery_root: None,
+            work_tree_from_env: false,
+            discovery_via_gitfile: true,
+            config_session: Mutex::new(None),
+            caches,
+            refs_backend,
+            environment,
+            command_runner: Arc::clone(&self.command_runner),
+            change_id_generator: Arc::clone(&self.change_id_generator),
+            diagnostics: Arc::clone(&self.diagnostics),
+            network_trace: self.network_trace,
+            reference_unix_time: self.reference_unix_time,
+            ownership_check: Arc::clone(&self.ownership_check),
+            thread_policy: self.thread_policy,
+            hook_stdio: self.hook_stdio,
+        };
+        repo.caches().configure_filter_subprocess(
+            &repo.environment,
+            repo.git_dir(),
+            repo.work_tree(),
+        );
+        repo.refresh_config_session()?;
+        Ok(repo)
+    }
+
+    fn repo_cached_settings_from_config(
+        cfg: &ConfigSet,
+        environment: &Environment,
+    ) -> RepoCachedSettings {
+        let use_replace_refs = cfg.bool_with_default("core.useReplaceRefs", true);
+        let replace_ref_base = environment
+            .git_replace_ref_base
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "refs/replace/".to_owned());
+        let replace_ref_base = if replace_ref_base.ends_with('/') {
+            replace_ref_base
+        } else {
+            format!("{replace_ref_base}/")
+        };
+        RepoCachedSettings {
+            use_replace_refs,
+            replace_ref_base,
+        }
+    }
+
+    pub(crate) fn ensure_config_arc(&self) -> Result<Arc<ConfigSet>> {
+        self.config_arc_with_validation(true)
+    }
+
+    /// Hot-path config access: session snapshot without stamp revalidation.
+    pub(crate) fn ensure_config_arc_fast(&self) -> Result<Arc<ConfigSet>> {
+        self.config_arc_with_validation(false)
+    }
+
+    fn config_arc_with_validation(&self, validate_stamps: bool) -> Result<Arc<ConfigSet>> {
+        if validate_stamps {
+            if let Ok(mut guard) = self.config_session.lock() {
+                if let Some(session) = guard.as_mut() {
+                    if session
+                        .validation
+                        .still_valid(&self.environment, &self.git_dir, || {
+                            self.config_load_options(true)
+                        })
+                    {
+                        return Ok(Arc::clone(&session.config));
+                    }
+                }
+            }
+        } else if let Ok(guard) = self.config_session.lock() {
+            if let Some(session) = guard.as_ref() {
+                return Ok(Arc::clone(&session.config));
+            }
+        }
+        self.refresh_config_session()?;
+        self.config_session
+            .lock()
+            .map_err(|_| Error::Config(ConfigError::ConfigSessionLockPoisoned))?
+            .as_ref()
+            .map(|s| Arc::clone(&s.config))
+            .ok_or_else(|| Error::Config(ConfigError::ConfigSessionMissingAfterRefresh))
+    }
+
+    fn refresh_config_session(&self) -> Result<()> {
+        crate::trace::trace_span!("grit.config.load");
+        let opts = self.config_load_options(true);
+        if let Ok(mut guard) = self.config_session.lock() {
+            if let Some(session) = guard.as_mut() {
+                if session
+                    .validation
+                    .still_valid(&self.environment, &self.git_dir, || opts.clone())
+                {
+                    return Ok(());
+                }
+                let env = self.environment.as_ref();
+                let base_stamps = config_file_stamps(env, Some(&self.git_dir), &opts);
+                if session.validation.base_stamps.as_slice() != base_stamps.as_slice() {
+                    self.caches.invalidate_config_file_derived();
+                }
+            }
+        }
+        self.caches.clear_session_config();
+        let env = self.environment.as_ref();
+        let cfg = self
+            .caches
+            .load_config_with_options(env, Some(&self.git_dir), &opts)?;
+        let key = ConfigCacheKey::new(Some(&self.git_dir), &opts);
+        let (env_fingerprint, base_stamps, extra_stamps) =
+            self.caches.config_entry_stamps(&key).unwrap_or_else(|| {
+                (
+                    env.config_fingerprint().unwrap_or_default(),
+                    config_file_stamps(env, Some(&self.git_dir), &opts),
+                    Vec::new(),
+                )
+            });
+        let cached_settings =
+            Self::repo_cached_settings_from_config(cfg.as_ref(), self.environment.as_ref());
+        let replace_lookup_inactive = self.replace_lookup_inactive(cfg.as_ref());
+        self.caches
+            .set_session_config(key.clone(), Arc::clone(&cfg));
+        let session = ConfigSession {
+            config: Arc::clone(&cfg),
+            validation: ConfigSessionValidation {
+                key,
+                env_fingerprint,
+                base_stamps,
+                extra_stamps,
+                environment: Arc::clone(&self.environment),
+            },
+            cached_settings,
+            replace_lookup_inactive,
+        };
+        *self
+            .config_session
+            .lock()
+            .map_err(|_| Error::Config(ConfigError::ConfigSessionLockPoisoned))? = Some(session);
+        Ok(())
+    }
+
+    fn replace_lookup_inactive(&self, cfg: &ConfigSet) -> bool {
+        if self.environment.git_no_replace_objects {
+            return true;
+        }
+        let Some(prefix) = Self::replace_ref_prefix_from_config(cfg, self.environment.as_ref())
+        else {
+            return true;
+        };
+        self.references()
+            .list(&prefix)
+            .map(|refs| refs.is_empty())
+            .unwrap_or(true)
+    }
+
+    fn replace_ref_prefix_from_config(
+        cfg: &ConfigSet,
+        environment: &Environment,
+    ) -> Option<String> {
+        if !cfg.bool_with_default("core.useReplaceRefs", true) {
+            return None;
+        }
+        let replace_ref_base = environment
+            .git_replace_ref_base
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("refs/replace");
+        Some(if replace_ref_base.ends_with('/') {
+            replace_ref_base.to_owned()
+        } else {
+            format!("{replace_ref_base}/")
+        })
+    }
+
+    /// Return the diagnostic sink installed on this repository.
+    #[must_use]
+    pub fn diagnostics(&self) -> DiagnosticsHandle {
+        Arc::clone(&self.diagnostics)
+    }
+
+    /// Replace the diagnostic sink (for embedders and the CLI).
+    pub fn set_diagnostics(&mut self, sink: DiagnosticsHandle) {
+        self.caches.set_diagnostics(Arc::clone(&sink));
+        self.diagnostics = sink;
+    }
+
+    /// Whether network trace events should be delivered to the diagnostic sink.
+    #[must_use]
+    pub fn network_trace_enabled(&self) -> bool {
+        self.network_trace
+    }
+
+    /// Enable or disable network trace events on this handle.
+    pub fn set_network_trace(&mut self, enabled: bool) {
+        self.network_trace = enabled;
+    }
+
+    pub(crate) fn warn(&self, warning: diagnostics::Warning) {
+        self.diagnostics.warn(warning);
+    }
+
+    /// Merged configuration read and local config write handle.
+    #[inline]
+    #[must_use]
+    pub fn config(&self) -> crate::config::Config<'_> {
+        crate::config::Config::new(self)
+    }
+
+    /// Drop the in-memory config snapshot and load a fresh cascade from disk.
+    ///
+    /// Call after writing `.git/config` (or other cascade files) through library APIs on this
+    /// repository handle so subsequent [`Self::config`] and hot-path readers observe the new data.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`ConfigSet::load`].
+    pub fn reload_config(&self) -> Result<()> {
+        self.caches.invalidate_config_cache();
+        if let Ok(mut guard) = self.config_session.lock() {
+            *guard = None;
+        }
+        self.refresh_config_session()?;
+        Ok(())
+    }
+
+    /// Warm repository caches after discovery (reftable backend flag, ref store).
+    pub(crate) fn install_config_snapshot(&self) {
+        let _ = self
+            .caches
+            .open_ref_store(&self.git_dir, self.environment.as_ref());
+    }
+
+    /// Common git directory for this handle (`commondir` when linked).
+    ///
+    /// The path is canonical. On Windows it uses the plain drive or UNC spelling (`C:\repo`)
+    /// that callers pass in and compare against, not the `\\?\` form [`std::fs::canonicalize`]
+    /// returns; the verbatim form is kept only when nothing else names the directory (longer
+    /// than `MAX_PATH`, or a component Win32 would rewrite, such as a trailing dot).
+    #[must_use]
+    pub fn common_git_dir(&self) -> &Path {
+        &self.common_git_dir
+    }
+
+    fn validate_repository_format_cached(&self) -> Result<()> {
+        let Some(config_path) = repository_config_path(&self.git_dir) else {
+            return Ok(());
+        };
+        let parsed = self.caches.repository_format(&self.git_dir, &config_path)?;
+        validate_repository_format_parsed(&parsed)
+    }
+
+    /// The pluggable ref backend for this repository (trait object).
+    ///
+    /// Unlike a backend opened on its own, this store checks every transaction against the
+    /// repository's objects in [`RefStore::prepare`](crate::refs::store::RefStore::prepare):
+    /// a direct value must name a stored object
+    /// ([`RefStoreError::MissingObject`](crate::refs::store::RefStoreError::MissingObject)),
+    /// and a branch or `HEAD` must name a commit
+    /// ([`RefStoreError::NotACommit`](crate::refs::store::RefStoreError::NotACommit)).
+    #[must_use]
+    pub fn ref_store(&self) -> &dyn crate::refs::store::RefStore {
+        &self.refs_backend
+    }
+
+    /// Whether [`Self::ref_store`] is an on-disk files or reftable backend, so `HEAD` and refs can
+    /// also be read from the git directory. False for injected stores such as
+    /// [`crate::refs::store::MemoryRefStore`].
+    #[must_use]
+    pub(crate) fn refs_on_disk(&self) -> bool {
+        use crate::refs::store::RefStorageFormat;
+        matches!(
+            self.ref_store().format(),
+            RefStorageFormat::Files | RefStorageFormat::Reftable
+        )
+    }
+
+    /// Object read/write handle for this repository.
+    #[inline]
+    #[must_use]
+    pub fn objects(&self) -> crate::objects::Objects<'_> {
+        crate::objects::Objects::new(self)
+    }
+
+    /// Reference resolve/list/update and reflog read handle.
+    #[inline]
+    #[must_use]
+    pub fn references(&self) -> crate::refs::References<'_> {
+        crate::refs::References::new(self)
+    }
+
+    /// Index load/write handle.
+    #[inline]
+    #[must_use]
+    pub fn index(&self) -> crate::index::IndexFile<'_> {
+        crate::index::IndexFile::new(self)
+    }
+
+    /// Revision parse and rev-list handle.
+    #[inline]
+    #[must_use]
+    pub fn revwalk(&self) -> crate::revwalk::RevWalk<'_> {
+        crate::revwalk::RevWalk::new(self)
+    }
+
+    /// Tree, index, and worktree diff handle.
+    #[inline]
+    #[must_use]
+    pub fn diff(&self) -> crate::diff::Diff<'_> {
+        crate::diff::Diff::new(self)
+    }
+
+    /// Remote configuration, `ls-remote`, fetch, and push for this repository.
+    #[must_use]
+    pub fn remotes(&self) -> crate::repo_handles::RepositoryRemotes<'_> {
+        crate::repo_handles::RepositoryRemotes::new(self)
+    }
+
+    /// Linked worktree listing and admin for this repository.
+    #[must_use]
+    pub fn worktrees(&self) -> crate::repo_handles::RepositoryWorktrees<'_> {
+        crate::repo_handles::RepositoryWorktrees::new(self)
+    }
+
+    /// Stash stack operations for this repository.
+    #[must_use]
+    pub fn stash(&self) -> crate::repo_handles::RepositoryStash<'_> {
+        crate::repo_handles::RepositoryStash::new(self)
+    }
+
+    /// Capture and restore workspace state (index with conflict stages, worktree, refs, sentinels).
+    #[must_use]
+    pub fn workspace_snapshot(&self) -> crate::repo_handles::RepositoryWorkspaceSnapshot<'_> {
+        crate::repo_handles::RepositoryWorkspaceSnapshot::new(self)
+    }
+
+    /// Git notes read/write for this repository.
+    #[must_use]
+    pub fn notes(&self) -> crate::repo_handles::RepositoryNotes<'_> {
+        crate::repo_handles::RepositoryNotes::new(self)
+    }
+
+    /// Hook script discovery for this repository.
+    #[must_use]
+    pub fn hooks(&self) -> crate::repo_handles::RepositoryHooks<'_> {
+        crate::repo_handles::RepositoryHooks::new(self)
+    }
+
+    /// Check object store connectivity, refs, and optional pack indexes.
+    ///
+    /// Progress is reported through `progress`; the library never prints.
+    ///
+    /// # Errors
+    ///
+    /// Propagates object-store, ref, or index failures that abort the run. A custom primary
+    /// object store is validated through the objects it lists (see [`crate::fsck::fsck`]).
+    pub fn fsck(
+        &self,
+        options: &crate::fsck::FsckOptions,
+        progress: &mut dyn crate::progress::ProgressSink,
+        cancel: &crate::progress::CancelToken,
+    ) -> crate::error::Result<crate::fsck::FsckReport> {
+        crate::fsck::fsck(self, options, progress, cancel)
+    }
+
+    /// SHA-256 content digest of a revision's tree ([tree-sha256] spec).
+    ///
+    /// [tree-sha256]: https://github.com/schacon/tree-sha256
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::TreeSha256MissingSubmodules`] when submodule
+    /// checkouts or objects needed for hashing are absent.
+    pub fn tree_sha256(
+        &self,
+        oid: crate::objects::ObjectId,
+        options: &crate::tree_sha256::TreeSha256Options,
+    ) -> crate::error::Result<crate::tree_sha256::TreeSha256Report> {
+        crate::tree_sha256::tree_sha256(self, oid, options)
+    }
+
+    /// Verify an annotated tag's signature and optional `tree-sha256` header.
+    ///
+    /// Reads the tag object by `oid` (not via a ref). Signature checking and digest
+    /// recomputation run on separate threads when both are needed.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::tree_sha256::verify_tag`].
+    pub fn verify_tag(
+        &self,
+        oid: crate::objects::ObjectId,
+        options: &crate::tree_sha256::TagVerifyOptions,
+    ) -> crate::error::Result<crate::tree_sha256::TagVerification> {
+        crate::tree_sha256::verify_tag(self, oid, options)
+    }
+
+    /// Patch-ID for a single commit (merge commits and empty diffs return `None`).
+    ///
+    /// Text diffs use the hunks of Git's default diff (Myers with change-compact
+    /// and the indent heuristic, three context lines on each side), matching
+    /// `git show --format= --no-ext-diff` piped to `git patch-id` in the
+    /// selected mode, including where an ambiguous insertion or deletion is
+    /// placed. Only context inside those hunks contributes to the ID. Stable
+    /// and unstable modes drop spaces, tabs, CR and LF before hashing; form
+    /// feed and vertical tab still count.
+    ///
+    /// # Errors
+    ///
+    /// Propagates object database read/parse failures.
+    pub fn patch_id(
+        &self,
+        commit: &crate::objects::ObjectId,
+        mode: crate::patch_ids::PatchIdMode,
+    ) -> crate::error::Result<Option<crate::objects::ObjectId>> {
+        crate::patch_ids::compute_patch_id(self.odb().hash_algo(), self.odb(), commit, mode)
+    }
+
+    /// Patch-IDs for every commit named by `specs`, as `(patch_id, commit)` pairs.
+    ///
+    /// A spec that is a top-level range expands to the commits that range selects, in
+    /// default `rev-list` order: `A..B` lists the commits reachable from `B` but not `A`,
+    /// and `A...B` lists the commits on both sides of the symmetric difference in one
+    /// walk-ordered sequence without saying which side each came from (use
+    /// [`crate::revwalk::RevWalkListOptions::cherry_mark`] to compare the sides). Any
+    /// other spec names one object, resolved like `git rev-parse` without index-path
+    /// guessing. Merge commits and commits with no file changes are skipped, as in
+    /// [`Self::patch_id`]. Results follow the order of `specs`; a commit named twice
+    /// appears twice.
+    ///
+    /// # Errors
+    ///
+    /// Propagates rev-parse, merge-base, and rev-list errors for unresolvable specs, and
+    /// object database read/parse failures while diffing.
+    pub fn patch_ids_for_revs(
+        &self,
+        specs: &[&str],
+        mode: crate::patch_ids::PatchIdMode,
+    ) -> crate::error::Result<Vec<(crate::objects::ObjectId, crate::objects::ObjectId)>> {
+        let walk = self.revwalk();
+        let walk_options = crate::revwalk::RevWalkListOptions::default();
+        let mut out = Vec::new();
+        for spec in specs {
+            let commits = if crate::rev_parse::is_top_level_range(spec) {
+                walk.commits(&[spec], &walk_options)?
+            } else {
+                vec![crate::rev_parse::resolve_revision_without_index_dwim(
+                    self, spec,
+                )?]
+            };
+            let patch_ids =
+                crate::rev_list::map_commits_in_parallel(&commits, |c| self.patch_id(c, mode));
+            for (patch_id, commit) in patch_ids.into_iter().zip(commits) {
+                if let Some(patch_id) = patch_id? {
+                    out.push((patch_id, commit));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reflog listing, deletion, and expiry for this repository.
+    #[must_use]
+    pub fn reflogs(&self) -> crate::repo_handles::RepositoryReflogs<'_> {
+        crate::repo_handles::RepositoryReflogs::new(self)
+    }
+
+    /// Bundle create, verify, list-heads, and unbundle for this repository.
+    #[must_use]
+    pub fn bundles(&self) -> crate::repo_handles::RepositoryBundles<'_> {
+        crate::repo_handles::RepositoryBundles::new(self)
+    }
+
+    /// Repack reachable objects into a single pack and prune redundant storage.
+    ///
+    /// # Errors
+    ///
+    /// Propagates pack, prune, or unsupported-backend failures from [`crate::maintenance::repack`].
+    pub fn repack(
+        &self,
+        opts: &crate::maintenance::RepackOptions,
+    ) -> crate::error::Result<crate::maintenance::RepackReport> {
+        crate::maintenance::repack(self, opts)
+    }
+
+    /// Resolve `refname` through this repository's ref store.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::refs::store::RefStoreError`] as [`Error::RefStore`].
+    pub(crate) fn resolve_ref_oid(&self, refname: &str) -> Result<crate::objects::ObjectId> {
+        self.ref_store()
+            .resolve(crate::refs::store::RefNameRef::from_trusted(refname))
+    }
+
+    /// Replace the ref store (embedders injecting [`crate::refs::store::MemoryRefStore`]).
+    ///
+    /// On a linked worktree's handle, `HEAD` and its reflog stay in the worktree's admin
+    /// directory (see [`RepositoryOptions::with_ref_store`]).
+    #[must_use]
+    pub fn with_ref_store(mut self, store: Arc<dyn crate::refs::store::RefStore>) -> Self {
+        let store = linked_worktree_view(&self.git_dir, store);
+        self.caches
+            .install_ref_store(&self.git_dir, Arc::clone(&store));
+        self.refs_backend = checked_ref_store_with_hooks(
+            store,
+            self.odb.clone(),
+            self.git_dir(),
+            self.work_tree().map(Path::as_ref),
+            &self.environment,
+            &self.command_runner,
+            self.hook_stdio,
+            &self.diagnostics,
+        );
+        self
+    }
+
+    /// Whether pathspec matching should NFC-normalize paths for this repository.
+    #[must_use]
+    pub(crate) fn pathspec_precompose_enabled(&self) -> bool {
+        self.caches
+            .pathspec_precompose_enabled(self.environment.as_ref(), &self.git_dir)
+    }
+
+    /// Pretend the work tree aliases NFD/NFC spellings, as APFS and HFS+ do, so unit tests on
+    /// other filesystems exercise the precomposed pathspec matching macOS users get.
+    #[cfg(test)]
+    pub(crate) fn force_pathspec_precompose_for_test(&self) {
+        self.caches.force_pathspec_precompose_for_test();
+    }
+
+    /// Resolve one argv pathspec against this repository's work tree.
+    ///
+    /// `prefix` is the work-tree-relative directory the pathspec was typed in (`None` at the
+    /// root). Magic pathspecs pass through; plain paths are joined with `prefix`, normalized, and
+    /// NFC-normalized when `core.precomposeunicode` is on and the filesystem aliases NFD/NFC
+    /// spellings. That decision is computed once per handle, so resolving many pathspecs costs no
+    /// config reload or filesystem probe per path.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::pathspec::PathspecResolveError::NeedsWorkTree`] for a bare repository, and
+    /// [`crate::pathspec::PathspecResolveError::OutsideRepository`] when `pathspec` resolves
+    /// outside the work tree.
+    pub fn resolve_worktree_pathspec(
+        &self,
+        pathspec: &str,
+        prefix: Option<&str>,
+    ) -> std::result::Result<String, crate::pathspec::PathspecResolveError> {
+        let work_tree = self
+            .work_tree()
+            .ok_or(crate::pathspec::PathspecResolveError::NeedsWorkTree)?;
+        Ok(
+            crate::pathspec::resolve_pathspec_in_worktree_with_argv_precompose(
+                pathspec,
+                pathspec,
+                work_tree,
+                prefix,
+                self.pathspec_precompose_enabled(),
+            )?,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn pathspec_match_context(&self) -> crate::pathspec::PathspecMatchContext {
+        crate::pathspec::pathspec_match_context_with_precompose(self.pathspec_precompose_enabled())
+    }
+
+    /// Whether `path` is selected by the resolved pathspec list `specs`.
+    ///
+    /// Shorthand for [`Self::pathspec_matcher_for`] followed by
+    /// [`crate::pathspec::PathspecMatcher::matches`]; build the matcher once instead when
+    /// filtering many paths with specs that may carry `:(attr:...)` magic.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::pathspec_matcher_for`].
+    pub fn paths_match_pathspecs(
+        &self,
+        path: &str,
+        pathspec: &crate::pathspec::Pathspec,
+    ) -> Result<bool> {
+        if pathspec.is_entire_tree() {
+            return Ok(true);
+        }
+        Ok(self.pathspec_matcher_for(pathspec)?.matches(path))
+    }
+
+    /// Prepare `pathspec` for matching many paths in this repository.
+    ///
+    /// The matcher applies Git's list semantics and every pathspec magic word, including
+    /// `:(attr:...)`, which is evaluated against this repository's attributes: the work-tree
+    /// stack (global file, root and nested `.gitattributes`, `info/attributes`), or
+    /// `info/attributes` and the global file for a bare repository. Attributes are read only
+    /// when a spec carries attr magic, once per matcher, from the per-handle cache; `[attr]`
+    /// macros are expanded and `core.ignorecase` makes attribute patterns case-insensitive.
+    /// Paths and specs follow `core.precomposeunicode`.
+    ///
+    /// # Errors
+    ///
+    /// Only when a spec carries attr magic: [`Error::InvalidAttrPathspec`] for a malformed or
+    /// repeated `attr:` clause, or the error from loading config or the attribute files (for
+    /// example an unreadable `core.attributesFile` setting or a poisoned cache lock).
+    pub(crate) fn pathspec_matcher_for<'s>(
+        &self,
+        pathspec: &'s crate::pathspec::Pathspec,
+    ) -> Result<crate::pathspec::PathspecMatcher<'s>> {
+        self.pathspec_matcher_with_globals(pathspec.specs(), pathspec.globals())
+    }
+
+    pub(crate) fn pathspec_matcher<'s>(
+        &self,
+        specs: &'s [String],
+    ) -> Result<crate::pathspec::PathspecMatcher<'s>> {
+        self.pathspec_matcher_with_globals(specs, crate::pathspec::PathspecGlobalFlags::default())
+    }
+
+    /// Like [`Self::pathspec_matcher`], with explicit Git global pathspec flags.
+    pub(crate) fn pathspec_matcher_with_globals<'s>(
+        &self,
+        specs: &'s [String],
+        globals: crate::pathspec::PathspecGlobalFlags,
+    ) -> Result<crate::pathspec::PathspecMatcher<'s>> {
+        let precompose = self.pathspec_precompose_enabled();
+        if !specs
+            .iter()
+            .any(|spec| crate::pathspec::pathspec_has_attr_magic(spec))
+        {
+            return Ok(crate::pathspec::PathspecMatcher::new(
+                specs, precompose, None, false, globals,
+            ));
+        }
+        crate::pathspec::validate_attr_pathspecs(specs)?;
+        let attrs = match self.work_tree() {
+            Some(work_tree) => self.caches().gitattributes_stack_shared(self, work_tree)?,
+            None => self.caches().gitattributes_bare_shared(self)?,
+        };
+        let icase = self.config().snapshot()?.ignore_case();
+        Ok(crate::pathspec::PathspecMatcher::new(
+            specs,
+            precompose,
+            Some(attrs),
+            icase,
+            globals,
+        ))
+    }
+
+    /// Resolve argv and optional from-file pathspecs into a [`crate::pathspec::Pathspec`].
+    ///
+    /// `options.cwd_prefix` overrides the repository environment cwd when resolving relative
+    /// paths; global flags come from [`crate::pathspec::PathspecOptions::globals`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::pathspec::PathspecResolveError`] when resolution fails.
+    pub fn pathspec(
+        &self,
+        items: impl IntoIterator<Item = impl AsRef<str>>,
+        options: &crate::pathspec::PathspecOptions,
+    ) -> std::result::Result<crate::pathspec::Pathspec, crate::pathspec::PathspecResolveError> {
+        options
+            .globals
+            .validate()
+            .map_err(crate::pathspec::PathspecResolveError::InvalidGlobals)?;
+        let argv: Vec<String> = items.into_iter().map(|s| s.as_ref().to_owned()).collect();
+        let cwd = options
+            .cwd_prefix
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.environment().cwd.clone());
+        let resolved = crate::pathspec::ResolvedPathspecs::resolve(
+            self,
+            &cwd,
+            &argv,
+            options.from_file.clone(),
+        )?;
+        Ok(crate::pathspec::Pathspec::from_resolved(
+            resolved,
+            options.globals,
+        ))
+    }
+
+    /// Repository-relative prefix of the process cwd for argv pathspecs (no trailing slash).
+    ///
+    /// Matches Git `GIT_PREFIX` / `pathdiff` semantics used by `git log --`, `git rev-list --`,
+    /// and `git blame` from a subdirectory.
+    #[must_use]
+    pub fn pathspec_cwd_prefix(&self) -> Option<&str> {
+        self.git_prefix.as_deref().filter(|p| !p.is_empty())
+    }
+
+    /// Cwd prefix for one argv pathspec (`None` for `:(top)` / `:/`, which stay repo-root-relative).
+    pub fn pathspec_argv_prefix<'a>(&'a self, pathspec: &str) -> Option<&'a str> {
+        if crate::pathspec::pathspec_has_top(pathspec) {
+            None
+        } else {
+            self.pathspec_cwd_prefix()
+        }
+    }
+
+    /// Resolve argv path operands for revision walks (`log`, `revs`, `rev-list`, …).
+    ///
+    /// Literal segments are interpreted relative to the process cwd under the work tree, like
+    /// `git diff --` and Git pathspec cwd rules. Exclude-only lists gain Git's implicit cwd
+    /// positive prefix when appropriate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PathError`] when a pathspec resolves outside the work tree.
+    pub fn resolve_rev_walk_pathspecs(
+        &self,
+        pathspec: &crate::pathspec::Pathspec,
+    ) -> Result<Vec<String>> {
+        if pathspec.is_entire_tree() {
+            return Ok(Vec::new());
+        }
+        let paths = pathspec.specs();
+        let prefix = self.pathspec_cwd_prefix();
+        let cwd_for_implicit = prefix.map(str::to_owned);
+        let mut resolved = Vec::with_capacity(paths.len());
+        if self.work_tree().is_some() {
+            for pathspec in paths {
+                let prefix = Self::pathspec_argv_prefix(self, pathspec);
+                let spec = self
+                    .resolve_worktree_pathspec(pathspec, prefix)
+                    .map_err(|e| Error::PathError(e.to_string()))?;
+                resolved.push(spec);
+            }
+        } else {
+            let root = self.git_dir();
+            for pathspec in paths {
+                let prefix = Self::pathspec_argv_prefix(self, pathspec);
+                resolved.push(crate::pathspec::resolve_pathspec(pathspec, root, prefix));
+            }
+        }
+        Ok(crate::pathspec::extend_pathspec_list_implicit_cwd(
+            &resolved,
+            cwd_for_implicit.as_deref(),
+        ))
+    }
+
+    /// Absolute path to the git directory (`.git/` or bare repository root).
+    ///
+    /// The path is canonical. On Windows it uses the plain drive or UNC spelling (`C:\repo`)
+    /// that callers pass in and compare against, not the `\\?\` form [`std::fs::canonicalize`]
+    /// returns; the verbatim form is kept only when nothing else names the directory (longer
+    /// than `MAX_PATH`, or a component Win32 would rewrite, such as a trailing dot).
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// Absolute work tree path for non-bare repositories.
+    ///
+    /// The path is canonical. On Windows it uses the plain drive or UNC spelling (`C:\repo`)
+    /// that callers pass in and compare against, not the `\\?\` form [`std::fs::canonicalize`]
+    /// returns; the verbatim form is kept only when nothing else names the directory (longer
+    /// than `MAX_PATH`, or a component Win32 would rewrite, such as a trailing dot).
+    #[must_use]
+    pub fn work_tree(&self) -> Option<&Path> {
+        self.work_tree.as_deref()
+    }
+
+    /// Object database for this repository.
+    #[must_use]
+    pub fn odb(&self) -> &Odb {
+        &self.odb
+    }
+
+    /// Fetch missing promisor objects in one batch before checkout or other bulk reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::PromisorFetcherMissing`] when no fetcher is installed, or transport failures from the fetcher.
+    pub fn prefetch_promised(&self, oids: &[ObjectId]) -> Result<()> {
+        let Some(fetcher) = self.caches().promisor_fetcher() else {
+            return Err(RepositoryError::PromisorFetcherMissing.into());
+        };
+        fetcher.fetch_missing(self, oids)
+    }
+
+    /// Discovery provenance for safe-directory and setup tracing.
+    #[must_use]
+    pub fn discovery_info(&self) -> DiscoveryInfo {
+        DiscoveryInfo {
+            explicit_git_dir: self.explicit_git_dir,
+            discovery_root: self.discovery_root.clone(),
+            work_tree_from_env: self.work_tree_from_env,
+            discovery_via_gitfile: self.discovery_via_gitfile,
+        }
+    }
+
+    fn cached_settings(&self) -> RepoCachedSettings {
+        if let Ok(guard) = self.config_session.lock() {
+            if let Some(session) = guard.as_ref() {
+                return session.cached_settings.clone();
+            }
+        }
+        self.ensure_config_arc_fast()
+            .map(|cfg| {
+                Self::repo_cached_settings_from_config(cfg.as_ref(), self.environment.as_ref())
+            })
+            .unwrap_or_else(|_| {
+                Self::repo_cached_settings_from_config(&ConfigSet::new(), self.environment.as_ref())
+            })
+    }
+
+    /// Initialise a repository at `path` and return an open handle plus init metadata.
+    ///
+    /// # Errors
+    ///
+    /// Propagates filesystem and layout errors from the underlying init helpers.
+    pub fn init(path: &Path, options: &InitOptions) -> Result<(Self, InitOutcome)> {
+        if options.bare && options.separate_git_dir.is_some() {
+            return Err(RepositoryError::InitBareWithSeparateGitDir.into());
+        }
+        let env = options
+            .environment
+            .clone()
+            .unwrap_or_else(Environment::empty);
+        let git_dir = resolve_git_dir_for_init(path, options)?;
+        let reinitialized = git_dir.join("config").is_file() && git_dir.join("HEAD").is_file();
+        let existing_format = hash_algo_from_git_dir(&git_dir)?;
+        let object_format = match (reinitialized, options.object_format) {
+            (true, None) => existing_format,
+            (true, Some(requested)) if requested != existing_format => {
+                return Err(RepositoryError::InitObjectFormatChange.into());
+            }
+            (true, Some(requested)) => requested,
+            (false, None) => HashAlgo::Sha1,
+            (false, Some(requested)) => requested,
+        };
+        let initial_branch = if reinitialized {
+            head_branch_name_for_outcome(&git_dir)?
+        } else {
+            resolve_initial_branch(&env, options.initial_branch.as_deref())?
+        };
+
+        let separate_layout = options.separate_git_dir.is_some()
+            || (!options.bare
+                && !options.bare_with_worktree_at_path
+                && path.join(".git").is_file());
+
+        let repo = if options.bare_with_worktree_at_path {
+            init_bare_with_env_worktree(
+                path,
+                path,
+                &initial_branch,
+                options.template_dir.as_deref(),
+                options.ref_storage,
+                object_format,
+                options.init_filesystem,
+                &env,
+            )?
+        } else if separate_layout {
+            init_repository_separate_git_dir(
+                path,
+                &git_dir,
+                &initial_branch,
+                options.template_dir.as_deref(),
+                options.ref_storage,
+                object_format,
+                options.init_filesystem,
+                &env,
+            )?
+        } else {
+            init_repository_with_object_format(
+                path,
+                options.bare,
+                &initial_branch,
+                options.template_dir.as_deref(),
+                options.ref_storage,
+                object_format,
+                options.init_filesystem,
+                &env,
+            )?
+        };
+        Ok((
+            repo,
+            InitOutcome {
+                reinitialized,
+                initial_branch,
+            },
+        ))
+    }
+
+    /// Open or resolve a repository at `path` using `options`.
+    ///
+    /// When [`RepositoryOptions::open_for_serving`] is set, `path` is resolved like
+    /// smart-HTTP serving (work tree, bare root, or `path.git`). Otherwise `path` is
+    /// the git directory and [`RepositoryOptions::work_tree`] selects the work tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotARepository`] when the layout is invalid.
+    pub fn open(path: &Path, options: &RepositoryOptions) -> Result<Self> {
+        if options.open_for_serving {
+            return Self::open_for_serving_internal(path, options);
+        }
+        Self::open_internal(options, path)
+    }
+
+    fn open_with_work_tree(
+        options: &RepositoryOptions,
+        git_dir: &Path,
+        work_tree: Option<&Path>,
+    ) -> Result<Self> {
+        let mut opts = options.clone();
+        opts.work_tree = work_tree.map(|p| p.to_path_buf());
+        Self::open_internal(&opts, git_dir)
+    }
+
+    fn open_internal(options: &RepositoryOptions, git_dir: &Path) -> Result<Self> {
+        let injected_refs = options.ref_store.clone();
+        let repo = if let Some(builder) = options.odb_builder.clone() {
+            Self::open_with_odb_internal(options, git_dir, builder, injected_refs)?
+        } else {
+            Self::open_internal_with_refs(options, git_dir, injected_refs)?
+        };
+        if let Some(branch) = options.initial_branch.as_deref() {
+            seed_unborn_head(repo.ref_store(), branch)?;
+        }
+        Ok(repo)
+    }
+
+    fn open_internal_with_refs(
+        options: &RepositoryOptions,
+        git_dir: &Path,
+        injected_refs: Option<Arc<dyn crate::refs::store::RefStore>>,
+    ) -> Result<Self> {
+        crate::trace::trace_span!("grit.repository.open");
+        let work_tree = options.work_tree.as_deref();
+        let git_dir = git_dir
+            .canonicalize_simplified()
+            .map_err(|_| not_a_repository_at(git_dir))?;
+
+        let repo = Self::from_canonical_git_dir(options, git_dir, work_tree, injected_refs)?;
+        repo.refresh_config_session()?;
+        read_core_bare_and_worktree_from_config(repo.config().snapshot()?.as_ref())?;
+        if options.validate_repository_format {
+            repo.validate_repository_format_cached()?;
+        }
+        repo.install_config_snapshot();
+        warn_core_bare_worktree_conflict(options, &repo);
+        Ok(repo)
+    }
+
+    fn open_for_serving_internal(path: &Path, options: &RepositoryOptions) -> Result<Self> {
+        let mut with_git_suffix = path.as_os_str().to_owned();
+        with_git_suffix.push(".git");
+        let candidates = [
+            (path.join(".git"), Some(path.to_path_buf())),
+            (path.to_path_buf(), None),
+            (PathBuf::from(with_git_suffix), None),
+        ];
+        for (git_dir, work_tree) in candidates {
+            if !git_dir.join("HEAD").is_file() {
+                continue;
+            }
+            let mut opts = options.clone();
+            opts.work_tree = work_tree;
+            opts.open_for_serving = false;
+            return Self::open_internal(&opts, &git_dir);
+        }
+        Err(not_a_repository_at(path))
+    }
+
+    fn open_with_odb_internal(
+        options: &RepositoryOptions,
+        git_dir: &Path,
+        mut builder: crate::odb::OdbBuilder,
+        injected_refs: Option<Arc<dyn crate::refs::store::RefStore>>,
+    ) -> Result<Self> {
+        let work_tree = options.work_tree.as_deref();
+        let environment = Arc::new(options.environment.clone());
+        let cwd = environment.discovery_cwd();
+        let command_runner = Arc::clone(&options.command_runner);
+        let change_id_generator = Arc::clone(&options.change_id_generator);
+
+        // With both stores injected nothing is read from the git directory's layout, so it
+        // may be empty or missing; config and the index are still looked up there.
+        let fully_injected = injected_refs.is_some() && builder.has_custom_primary();
+        let requested_git_dir = cwd.join(git_dir);
+        let git_dir = match requested_git_dir.canonicalize_simplified() {
+            Ok(dir) => dir,
+            Err(_) if fully_injected => canonicalize_existing_prefix(&requested_git_dir)?,
+            Err(_) => return Err(not_a_repository_at(git_dir)),
+        };
+
+        if injected_refs.is_none() && !head_file_present(&git_dir) {
+            return Err(not_a_repository_at(&git_dir));
+        }
+
+        let common_git_dir = resolve_common_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
+        let objects_dir = resolve_objects_dir(&environment, &git_dir, &common_git_dir)
+            .ok_or_else(|| not_a_repository_at(&git_dir))?;
+
+        // A custom primary does not need objects/ to exist, but the builder must still name it.
+        if !builder.has_custom_primary() && !objects_dir.exists() {
+            return Err(not_a_repository_at(&git_dir));
+        }
+        let objects_dir = canonicalize_existing_prefix(&objects_dir)?;
+        let builder_objects = canonicalize_existing_prefix(&cwd.join(builder.objects_dir()))?;
+        if builder_objects != objects_dir {
+            return Err(RepositoryError::OdbObjectsDirMismatch {
+                builder: builder_objects,
+                repository: objects_dir,
+            }
+            .into());
+        }
+        builder.set_objects_dir(objects_dir);
+        let injected_algos: Vec<HashAlgo> = builder.injected_hash_algos().collect();
+
+        let work_tree = match work_tree {
+            Some(p) => {
+                let mut resolved = cwd.join(p);
+                if resolved.exists() {
+                    resolved = resolved
+                        .canonicalize_simplified()
+                        .map_err(|_| Error::PathError(p.display().to_string()))?;
+                }
+                Some(resolved)
+            }
+            None => None,
+        };
+
+        let caches = RepoCaches::with_diagnostics(
+            Arc::clone(&command_runner),
+            Arc::clone(&options.diagnostics),
+            options.reftable_write,
+        );
+        let odb = builder
+            .build()
+            .with_config_git_dir(git_dir.clone())
+            .with_shared_config_state(caches.clone(), environment.clone())
+            .with_resolved_work_tree(work_tree.clone());
+
+        let git_prefix = work_tree
+            .as_ref()
+            .and_then(|wt| compute_git_prefix(environment.as_ref(), wt));
+
+        let refs_backend = checked_ref_store_with_hooks(
+            open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?,
+            odb.clone(),
+            &git_dir,
+            work_tree.as_deref(),
+            &environment,
+            &command_runner,
+            options.hook_stdio,
+            &options.diagnostics,
+        );
+        caches.configure_filter_subprocess(&environment, &git_dir, work_tree.as_deref());
+
+        let repo = Self {
+            git_dir,
+            common_git_dir,
+            work_tree,
+            odb,
+            explicit_git_dir: false,
+            discovery_root: None,
+            work_tree_from_env: false,
+            discovery_via_gitfile: false,
+            config_session: Mutex::new(None),
+            caches,
+            refs_backend,
+            environment,
+            git_prefix,
+            command_runner,
+            change_id_generator,
+            diagnostics: Arc::clone(&options.diagnostics),
+            network_trace: options.network_trace,
+            reference_unix_time: options.reference_unix_time,
+            ownership_check: options.ownership_check(),
+            thread_policy: options.thread_policy,
+            hook_stdio: options.hook_stdio,
+        };
+        repo.refresh_config_session()?;
+        if options.validate_repository_format {
+            repo.validate_repository_format_cached()?;
+        }
+        repo.check_injected_object_format(&injected_algos)?;
+        warn_core_bare_worktree_conflict(options, &repo);
+        Ok(repo)
+    }
+
+    /// Fail with [`RepositoryError::ObjectFormatMismatch`] when one of `injected` (the hash algorithms
+    /// of the stores and commit-graph passed to [`RepositoryOptions::with_odb_builder`]) differs from
+    /// `extensions.objectformat`, SHA-1 when unset.
+    ///
+    /// Reads the config snapshot the open already loaded. Files-backed primaries and
+    /// alternates take the repository's algorithm themselves and are not listed.
+    fn check_injected_object_format(&self, injected: &[HashAlgo]) -> Result<()> {
+        if injected.is_empty() {
+            return Ok(());
+        }
+        let repository = self
+            .ensure_config_arc_fast()?
+            .value("extensions.objectformat")
+            .and_then(|name| HashAlgo::from_name(&name))
+            .unwrap_or(HashAlgo::Sha1);
+        match injected.iter().find(|algo| **algo != repository) {
+            Some(&store) => Err(RepositoryError::ObjectFormatMismatch { repository, store }.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// Discover a repository starting from `start` (defaults to [`Environment::cwd`] when `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotARepository`] when no repository is found in the search path.
+    /// Returns [`Error::Config`] when a config file in the discovery cascade is malformed or
+    /// contains an invalid value (for example a non-boolean `core.bare`).
+    pub fn discover(start: Option<&Path>, options: &RepositoryOptions) -> Result<Self> {
+        let env = &options.environment;
+        let cwd = env.discovery_cwd();
+
+        // GIT_DIR override
+        if let Some(dir) = env.git_dir.as_deref() {
+            let mut git_dir = PathBuf::from(dir);
+            if git_dir.is_relative() {
+                git_dir = cwd.join(git_dir);
+            }
+            // `GIT_DIR` may name a gitfile (`.git` as a file); resolve like Git's `read_gitfile`.
+            git_dir = resolve_git_dir_env_path(&git_dir)?;
+            let work_tree = env.git_work_tree.as_deref().map(|wt| {
+                let p = PathBuf::from(wt);
+                if p.is_absolute() {
+                    p
+                } else {
+                    cwd.join(p)
+                }
+            });
+            if let Some(ref wt_path) = work_tree {
+                if env
+                    .git_work_tree
+                    .as_deref()
+                    .is_some_and(|raw| Path::new(raw).is_absolute())
+                {
+                    validate_git_work_tree_path(wt_path)?;
+                }
+            }
+            if work_tree.is_some() {
+                let mut repo = Self::open_with_work_tree(options, &git_dir, work_tree.as_deref())?;
+                repo.explicit_git_dir = true;
+                repo.discovery_root = None;
+                repo.work_tree_from_env = false;
+                repo.discovery_via_gitfile = false;
+                return Ok(repo);
+            }
+            // `GIT_DIR` without `GIT_WORK_TREE`: honour `core.bare` / `core.worktree` like Git.
+            let (is_bare, core_wt) = read_core_bare_and_worktree(&git_dir)?;
+            let bare_worktree_conflict = is_bare && core_wt.is_some();
+            let resolved_wt = if is_bare {
+                None
+            } else if let Some(raw) = core_wt {
+                Some(resolve_core_worktree_path(&git_dir, &raw)?)
+            } else {
+                // Without `GIT_WORK_TREE`, Git uses the current working directory as the work
+                // tree root (see git-config(1) / `git help repository-layout`), not the parent
+                // of `$GIT_DIR`. This matches upstream tests that run
+                // `GIT_DIR=other/.git git …` from the top-level repo while manipulating paths
+                // under `$PWD` (e.g. t5402-post-merge-hook).
+                Some(
+                    cwd.canonicalize_simplified()
+                        .unwrap_or_else(|_| cwd.clone()),
+                )
+            };
+            let mut repo = Self::open_with_work_tree(options, &git_dir, resolved_wt.as_deref())?;
+            repo.explicit_git_dir = true;
+            repo.discovery_root = None;
+            repo.work_tree_from_env = false;
+            repo.discovery_via_gitfile = false;
+            let _ = bare_worktree_conflict;
+            return Ok(repo);
+        }
+
+        // If GIT_WORK_TREE is set without GIT_DIR, we still need to honor it
+        // after discovery (path is relative to cwd, like Git).
+        let env_work_tree = env.git_work_tree.as_deref().map(|wt| {
+            let p = PathBuf::from(wt);
+            if p.is_absolute() {
+                p
+            } else {
+                cwd.join(p)
+            }
+        });
+        if let Some(ref p) = env_work_tree {
+            if env
+                .git_work_tree
+                .as_deref()
+                .is_some_and(|raw| Path::new(raw).is_absolute())
+            {
+                validate_git_work_tree_path(p)?;
+            }
+        }
+        let start = start.unwrap_or(&cwd);
+        let start = if start.is_absolute() {
+            start.to_path_buf()
+        } else {
+            cwd.join(start)
+        };
+
+        // Parse GIT_CEILING_DIRECTORIES — mirror Git `setup_git_directory_gently_1` +
+        // `longest_ancestor_length` on the canonical cwd path.
+        // A leading colon disables symlink resolution for both ceiling paths and cwd.
+        let (ceiling_paths, no_resolve_ceilings) = parse_ceiling_directories(env);
+        let ceiling_dirs: Vec<String> = ceiling_paths
+            .into_iter()
+            .map(|p| path_for_ceiling_compare(&p))
+            .collect();
+
+        let start_canon = start
+            .canonicalize_simplified()
+            .unwrap_or_else(|_| start.clone());
+        // For ceiling comparison, use non-canonical path when leading colon disables resolution.
+        let ceil_cmp_buf = if no_resolve_ceilings {
+            path_for_ceiling_compare(&start)
+        } else {
+            path_for_ceiling_compare(&start_canon)
+        };
+        let mut dir_buf = path_for_ceiling_compare(&start_canon);
+        let min_offset = offset_1st_component(&dir_buf);
+        let mut ceil_offset: isize = longest_ancestor_length(&ceil_cmp_buf, &ceiling_dirs)
+            .map(|n| n as isize)
+            .unwrap_or(-1);
+        if ceiling_dirs.contains(&dir_buf) {
+            ceil_offset = dir_buf.len() as isize;
+        } else if ceil_offset < 0 {
+            ceil_offset = min_offset as isize - 2;
+        }
+
+        loop {
+            let current = Path::new(&dir_buf);
+            if let Some(DiscoveredAt { mut repo, gitfile }) = try_open_at(options, current)? {
+                // git/setup.c `setup_git_directory` runs `check_repository_format` on the resolved
+                // git dir and dies on a bad format (e.g. a v1-only `extensions.*` in a
+                // `repositoryformatversion = 0` repo; t0001 #60). Discovery itself opens with
+                // validation skipped so an empty `.git/` is walked past, but a *found* repository
+                // must satisfy the format check.
+                repo.environment = Arc::new(env.clone());
+                repo.refresh_config_session()?;
+                repo.validate_repository_format_cached()?;
+                repo.install_config_snapshot();
+                let cfg = repo.config().snapshot()?;
+                repo.set_diagnostics(Arc::clone(&options.diagnostics));
+                if let Some(ref wt) = env_work_tree {
+                    repo.work_tree =
+                        Some(wt.canonicalize_simplified().unwrap_or_else(|_| wt.clone()));
+                    repo.work_tree_from_env = true;
+                } else {
+                    repo.work_tree_from_env = false;
+                    // Linked worktree (gitfile → admin dir with `commondir`): `Repository::open`
+                    // already set `work_tree` to the directory that contains the `.git` file.
+                    // Do not replace it with `core.worktree` from the common config — it may be
+                    // stale (t1501 multi-worktree) or point at another linked checkout.
+                    let linked_gitfile =
+                        repo.discovery_via_gitfile && resolve_common_dir(&repo.git_dir).is_some();
+                    if !linked_gitfile {
+                        let (is_bare, core_wt) =
+                            read_core_bare_and_worktree_from_config(cfg.as_ref())?;
+                        if is_bare {
+                            repo.work_tree = None;
+                        } else if let Some(raw) = core_wt {
+                            repo.work_tree = Some(resolve_core_worktree_path(&repo.git_dir, &raw)?);
+                        }
+                    }
+                }
+                let ownership_check = options.ownership_check();
+                if ownership_check.always_apply_safe_directory() {
+                    repo.enforce_safe_directory()?;
+                } else {
+                    ensure_valid_ownership(
+                        ownership_check.as_ref(),
+                        env,
+                        gitfile.as_deref(),
+                        repo.work_tree.as_deref(),
+                        &repo.git_dir,
+                    )?;
+                }
+                if let Some(wt) = repo.work_tree.as_ref() {
+                    repo.git_prefix = compute_git_prefix(env, wt);
+                }
+                return Ok(repo);
+            }
+
+            let mut offset: isize = dir_buf.len() as isize;
+            if offset <= min_offset as isize {
+                break;
+            }
+            loop {
+                offset -= 1;
+                if offset <= ceil_offset {
+                    break;
+                }
+                if dir_buf
+                    .as_bytes()
+                    .get(offset as usize)
+                    .is_some_and(|b| *b == b'/')
+                {
+                    break;
+                }
+            }
+            if offset <= ceil_offset {
+                break;
+            }
+            let off_u = offset as usize;
+            let new_len = if off_u > min_offset {
+                off_u
+            } else {
+                min_offset
+            };
+            dir_buf.truncate(new_len);
+        }
+
+        Err(not_a_repository_at(&start))
+    }
+
+    /// Path to the index file.
+    #[must_use]
+    pub(crate) fn index_path(&self) -> PathBuf {
+        self.git_dir.join("index")
+    }
+
+    /// Resolve which index file to use, honouring `GIT_INDEX_FILE` like Git plumbing.
+    ///
+    /// Relative paths are resolved from the process current directory.
+    pub(crate) fn index_path_for_env(&self) -> Result<PathBuf> {
+        if let Some(raw) = self.environment.git_index_file.as_deref() {
+            if !raw.is_empty() {
+                let p = PathBuf::from(raw);
+                return Ok(if p.is_absolute() {
+                    p
+                } else {
+                    self.environment.discovery_cwd().join(p)
+                });
+            }
+        }
+        Ok(self.index_path())
+    }
+
+    /// Load the index, expanding sparse-directory placeholders from the object database.
+    ///
+    /// Commands that operate on individual paths should use this instead of [`Index::load`].
+    pub(crate) fn load_index(&self) -> IndexResult<Index> {
+        let path = self.index_path_for_env()?;
+        self.load_index_at(&path)
+    }
+
+    /// Like [`Repository::load_index`], but reads from an explicit index file path
+    /// (e.g. `GIT_INDEX_FILE` or a worktree-specific index).
+    pub(crate) fn load_index_at(&self, path: &std::path::Path) -> IndexResult<Index> {
+        self.load_index_at_with_context(
+            path,
+            crate::index::IndexParseContext::from_policy(self.thread_policy()),
+        )
+    }
+
+    pub(crate) fn load_index_at_with_context(
+        &self,
+        path: &std::path::Path,
+        parse_ctx: crate::index::IndexParseContext,
+    ) -> IndexResult<Index> {
+        let mut idx = self.load_index_at_preserving_sparse(path, parse_ctx)?;
+        let cfg = self
+            .config()
+            .snapshot()
+            .unwrap_or_else(|_| Arc::new(ConfigSet::new()));
+        idx.expand_sparse_directory_placeholders(
+            &self.odb,
+            crate::path_validate::ProtectOptions::from_config(cfg.as_ref()),
+        )?;
+        self.clear_present_skip_worktree(&mut idx, cfg.as_ref());
+        Ok(idx)
+    }
+
+    /// Load rows for a sparse-aware operation, with the same repository context as `load_index`.
+    pub(crate) fn load_index_preserving_sparse(&self) -> IndexResult<Index> {
+        self.load_index_at_preserving_sparse(
+            &self.index_path_for_env()?,
+            crate::index::IndexParseContext::from_policy(self.thread_policy()),
+        )
+    }
+
+    /// Load the index at `path` without expanding sparse-directory placeholders (and
+    /// so without reading any tree), resolving a split index.
+    pub(crate) fn load_index_at_preserving_sparse(
+        &self,
+        path: &std::path::Path,
+        parse_ctx: crate::index::IndexParseContext,
+    ) -> IndexResult<Index> {
+        crate::trace::trace_span!("grit.index.read");
+        let cfg = self
+            .config()
+            .snapshot()
+            .unwrap_or_else(|_| Arc::new(ConfigSet::new()));
+        cfg.as_ref()
+            .get_bool("index.sparse")
+            .map_err(crate::index::IndexError::from)?;
+        let mut idx = Index::load_preserving_sparse_optional_with_context(
+            path,
+            &self.odb,
+            Some(cfg.as_ref()),
+            parse_ctx,
+        )?;
+        crate::split_index::resolve_split_index_if_needed(&mut idx, &self.git_dir, path)?;
+        if idx.source_mtime.is_none() {
+            idx.source_mtime = crate::index::index_file_mtime(path);
+        }
+        Ok(idx)
+    }
+
+    pub(crate) fn clear_present_skip_worktree(&self, index: &mut Index, cfg: &ConfigSet) {
+        if let Some(ref wt) = self.work_tree {
+            crate::sparse_checkout::clear_skip_worktree_from_present_files(
+                &self.git_dir,
+                wt,
+                index,
+                Some(cfg),
+            );
+        }
+    }
+
+    /// Write the index to the default path after optionally collapsing skip-worktree
+    /// subtrees into sparse-directory placeholders (when sparse index is enabled).
+    pub(crate) fn write_index(&self, index: &mut Index) -> IndexResult<()> {
+        self.write_index_with_post_index_change(index, false, false)
+    }
+
+    /// Acquire `.git/index.lock` before mutating the working tree for index+worktree commands.
+    ///
+    /// Call [`Self::commit_index_update`] to persist the index and release the lock, or drop the
+    /// lock without committing to abort without writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the lock file already exists or cannot be created.
+    pub(crate) fn begin_index_update(&self) -> IndexResult<crate::index::IndexLock> {
+        test_inject_index_write_fail()?;
+        let _ = crate::porcelain::commit::reap_stale_next_index_files(self, false)?;
+        let path = self.index_path_for_env()?;
+        let cfg = self.config().snapshot()?;
+        crate::index::IndexLock::acquire(&path, Some(cfg.as_ref()))
+    }
+
+    /// Write `index` to disk using a lock from [`Self::begin_index_update`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates index finalization, serialization, and I/O failures.
+    pub(crate) fn commit_index_update(
+        &self,
+        lock: &mut crate::index::IndexLock,
+        index: &mut Index,
+        updated_workdir: bool,
+    ) -> IndexResult<()> {
+        self.flush_index_update(lock, index)?;
+        self.finish_index_update(lock, updated_workdir)
+    }
+
+    /// Serialize `index` into a held [`crate::index::IndexLock`] without replacing the on-disk index.
+    pub(crate) fn flush_index_update(
+        &self,
+        lock: &mut crate::index::IndexLock,
+        index: &mut Index,
+    ) -> IndexResult<()> {
+        let path = lock.index_path.clone();
+        let (skip_hash, cfg) = self.prepare_index_for_disk_write(&path, index)?;
+        self.odb.flush_for_publish()?;
+        write_index_file_split(
+            &path,
+            &self.git_dir,
+            index,
+            cfg.as_ref(),
+            WriteSplitIndexRequest::default(),
+            skip_hash,
+            self.thread_policy(),
+            Some(lock),
+            false,
+        )
+        .map_err(IndexError::from)
+    }
+
+    /// Commit a staged index lock after a successful working-tree update.
+    pub(crate) fn finish_index_update(
+        &self,
+        lock: &mut crate::index::IndexLock,
+        updated_workdir: bool,
+    ) -> IndexResult<()> {
+        lock.commit_replace_index()?;
+        let updated_workdir_arg = if updated_workdir { "1" } else { "0" };
+        let _ = run_hook(self, "post-index-change", &[updated_workdir_arg, "0"], None)
+            .map_err(|e| IndexError::from(Error::from(e)))?;
+        Ok(())
+    }
+
+    /// Write a `.bitmap` sidecar for the largest pack in the primary object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::pack_bitmap::PackBitmapWriteError`] when no pack index exists or the
+    /// pack is not closed under reachability from repository refs.
+    pub fn write_largest_pack_bitmap(
+        &self,
+        options: &crate::pack_bitmap::PackBitmapWriteOptions,
+        now: std::time::SystemTime,
+    ) -> std::result::Result<std::path::PathBuf, crate::pack_bitmap::PackBitmapWriteError> {
+        let path = self
+            .odb
+            .largest_pack_index_path()
+            .map_err(|e| crate::pack_bitmap::PackBitmapWriteError::Object(e.to_string()))?
+            .ok_or(crate::pack_bitmap::PackBitmapWriteError::InvalidPackPath(
+                "no pack index in object store".to_owned(),
+            ))?;
+        crate::pack_bitmap::PackBitmapWriter::write(self, &path, options, now)
+    }
+
+    /// Persist the index when the lock can be acquired (Git `repo_update_index_if_able`).
+    ///
+    /// Opportunistic writers such as `status` stat refresh call this instead of
+    /// [`Repository::write_index`]: a held `.git/index.lock` or an unwritable repository
+    /// directory must not fail the parent operation.
+    ///
+    /// Returns `Ok(true)` when the index was written, `Ok(false)` when persistence was skipped.
+    ///
+    /// # Errors
+    ///
+    /// Propagates non-recoverable failures (for example cache-tree verification or split-index
+    /// constraints).
+    pub(crate) fn try_write_index(&self, index: &mut Index) -> IndexResult<bool> {
+        self.try_write_index_at(&self.index_path_for_env()?, index)
+    }
+
+    /// Like [`Repository::try_write_index`], but writes to an explicit index file path
+    /// (for example the path selected by `GIT_INDEX_FILE`).
+    pub(crate) fn try_write_index_at(&self, path: &Path, index: &mut Index) -> IndexResult<bool> {
+        if !self.environment().git_optional_locks {
+            return Ok(false);
+        }
+        let cfg = self.config().snapshot().ok();
+        let mut lock = match crate::index::IndexLock::acquire(path, cfg.as_deref()) {
+            Ok(lock) => lock,
+            Err(e) if Self::opportunistic_index_write_skippable(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let on_disk = crate::index::read_index_on_disk_identity(path, index.hash_algo)?;
+        if !crate::index::opportunistic_index_write_still_current(index, &on_disk) {
+            return Ok(false);
+        }
+        match self.write_index_with_lock(&mut lock, index, false) {
+            Ok(()) => Ok(true),
+            Err(e) if Self::opportunistic_index_write_skippable(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn opportunistic_index_write_skippable(err: &IndexError) -> bool {
+        match err {
+            IndexError::LockHeld(..) => true,
+            IndexError::PathIo(path_io) => matches!(
+                path_io.source.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ),
+            _ => false,
+        }
+    }
+
+    /// Write the index to the default path and pass explicit `post-index-change` hook flags.
+    ///
+    /// Parameters:
+    /// - `index` is the in-memory index to serialize.
+    /// - `updated_workdir` reports that the write is paired with a working-tree update.
+    /// - `updated_skipworktree` reports that skip-worktree related index state changed.
+    ///
+    /// Returns `Ok(())` after the index is written and the hook has been attempted.
+    ///
+    /// Errors when the index cannot be finalized or written.
+    pub(crate) fn write_index_with_post_index_change(
+        &self,
+        index: &mut Index,
+        updated_workdir: bool,
+        updated_skipworktree: bool,
+    ) -> IndexResult<()> {
+        let path = self.index_path_for_env()?;
+        self.write_index_at_with_post_index_change(
+            &path,
+            index,
+            updated_workdir,
+            updated_skipworktree,
+        )
+    }
+
+    /// Like [`Repository::write_index`], but writes to an explicit index file path.
+    pub(crate) fn write_index_at(
+        &self,
+        path: &std::path::Path,
+        index: &mut Index,
+    ) -> IndexResult<()> {
+        self.write_index_at_with_post_index_change(path, index, false, false)
+    }
+
+    /// Like [`Repository::write_index_at`], with explicit split-index emission control.
+    pub(crate) fn write_index_at_with_split(
+        &self,
+        path: &std::path::Path,
+        index: &mut Index,
+        split: WriteSplitIndexRequest,
+    ) -> IndexResult<()> {
+        self.write_index_at_split(path, index, split)
+    }
+
+    /// Whether reading `index` under this repository's config would mark the cache changed solely to
+    /// materialize a split index.
+    ///
+    /// Like [`Repository::write_index_at`], but passes explicit `post-index-change` hook flags.
+    ///
+    /// Parameters:
+    /// - `path` is the destination index file.
+    /// - `index` is the in-memory index to serialize.
+    /// - `updated_workdir` reports that the write is paired with a working-tree update.
+    /// - `updated_skipworktree` reports that skip-worktree related index state changed.
+    ///
+    /// Returns `Ok(())` after the index is written and the hook has been attempted.
+    ///
+    /// Errors when the index cannot be finalized or written.
+    pub(crate) fn write_index_at_with_post_index_change(
+        &self,
+        path: &std::path::Path,
+        index: &mut Index,
+        updated_workdir: bool,
+        updated_skipworktree: bool,
+    ) -> IndexResult<()> {
+        self.write_index_at_split_with_post_index_change(
+            path,
+            index,
+            WriteSplitIndexRequest::default(),
+            updated_workdir,
+            updated_skipworktree,
+        )
+    }
+
+    /// Write the index to `path`, optionally emitting a split index (shared base + `link` extension).
+    pub(crate) fn write_index_at_split(
+        &self,
+        path: &std::path::Path,
+        index: &mut Index,
+        split: WriteSplitIndexRequest,
+    ) -> IndexResult<()> {
+        self.write_index_at_split_with_post_index_change(path, index, split, false, false)
+    }
+
+    /// Write the index to `path`, optionally emitting a split index, with explicit hook flags.
+    ///
+    /// Parameters:
+    /// - `path` is the destination index file.
+    /// - `index` is the in-memory index to serialize.
+    /// - `split` controls whether a split index should be written.
+    /// - `updated_workdir` reports that the write is paired with a working-tree update.
+    /// - `updated_skipworktree` reports that skip-worktree related index state changed.
+    ///
+    /// Returns `Ok(())` after the index is written and the hook has been attempted.
+    ///
+    /// Errors when the index cannot be finalized or written.
+    pub(crate) fn write_index_at_split_with_post_index_change(
+        &self,
+        path: &std::path::Path,
+        index: &mut Index,
+        split: WriteSplitIndexRequest,
+        updated_workdir: bool,
+        updated_skipworktree: bool,
+    ) -> IndexResult<()> {
+        self.write_index_file(
+            path,
+            index,
+            split,
+            updated_workdir,
+            updated_skipworktree,
+            None,
+        )
+        .map_err(IndexError::from)
+    }
+
+    /// Persist `index` through `lock` (from [`Self::lock_index`] or [`Self::begin_index_update`])
+    /// and replace the on-disk index, with the same sparse/split-index handling and
+    /// `post-index-change` hook as [`Self::write_index`].
+    ///
+    /// `updated_workdir` is reported to the hook: set it when the write follows a working-tree
+    /// update made under the same lock.
+    ///
+    /// # Errors
+    ///
+    /// Propagates index finalization, serialization, and I/O failures. On error the lock is
+    /// still held and released when dropped.
+    pub(crate) fn write_index_with_lock(
+        &self,
+        lock: &mut crate::index::IndexLock,
+        index: &mut Index,
+        updated_workdir: bool,
+    ) -> IndexResult<()> {
+        let path = lock.index_path.clone();
+        self.write_index_file(
+            &path,
+            index,
+            WriteSplitIndexRequest::default(),
+            updated_workdir,
+            false,
+            Some(lock),
+        )
+        .map_err(IndexError::from)
+    }
+
+    /// Lock the index selected by `GIT_INDEX_FILE` (or `$GIT_DIR/index`) without reading it.
+    ///
+    /// Commands that change the working tree together with the index take this lock before
+    /// their first visible write, so a held lock refuses the whole command instead of failing
+    /// after files were already rewritten. Persist with [`Self::write_index_with_lock`];
+    /// dropping the lock without writing leaves the index as is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LockHeld`] when another process still holds the lock after the
+    /// `core.filesRefLockTimeout` wait, or [`Error::Io`] when the lock cannot be created.
+    pub(crate) fn lock_index(&self) -> Result<crate::index::IndexLock> {
+        let path = self.index_path_for_env()?;
+        let cfg = self.config().snapshot()?;
+        crate::index::IndexLock::acquire(&path, Some(cfg.as_ref())).map_err(Into::into)
+    }
+
+    /// Lock the index selected by `GIT_INDEX_FILE` (or `$GIT_DIR/index`), then load it.
+    ///
+    /// Read-modify-write commands must load the index only after the lock is held: an index
+    /// read before locking can be replaced by a concurrent writer, and writing the stale copy
+    /// back would silently drop that writer's update. Persist with
+    /// [`Self::write_index_with_lock`]; dropping the lock without writing leaves the index as is.
+    ///
+    /// Returns the held lock and the index read under it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LockHeld`] when another process still holds the lock after the
+    /// `core.filesRefLockTimeout` wait, and propagates index read and parse failures
+    /// (including [`std::io::ErrorKind::NotFound`] when there is no index file yet).
+    pub(crate) fn lock_and_load_index(&self) -> Result<(crate::index::IndexLock, Index)> {
+        let lock = self.lock_index()?;
+        let index = self.load_index_at(&lock.index_path)?;
+        Ok((lock, index))
+    }
+
+    /// Like [`Self::lock_and_load_index`], but keeps sparse-directory placeholders collapsed.
+    pub(crate) fn lock_and_load_index_preserving_sparse(
+        &self,
+    ) -> Result<(crate::index::IndexLock, Index)> {
+        let lock = self.lock_index()?;
+        let index = self.load_index_at_preserving_sparse(
+            &lock.index_path,
+            crate::index::IndexParseContext::from_policy(self.thread_policy()),
+        )?;
+        Ok((lock, index))
+    }
+
+    /// Shared pre-write housekeeping for [`Self::write_index_file`] and [`Self::flush_index_update`].
+    fn prepare_index_for_disk_write(
+        &self,
+        path: &std::path::Path,
+        index: &mut Index,
+    ) -> Result<(bool, Arc<ConfigSet>)> {
+        test_inject_index_write_fail()?;
+        // The on-disk index format (entry OID width and trailing checksum) is
+        // fixed by the repository's hash algorithm. Stamp it here so every
+        // index written through the repository is consistent, regardless of how
+        // the in-memory `Index` was constructed (e.g. a fresh `Index::new`).
+        index.hash_algo = self.odb.hash_algo();
+        self.finalize_sparse_index_if_needed(index)?;
+        let prev_index_mtime = crate::index::index_file_mtime(path);
+        let cfg = self.config().snapshot()?;
+        if let Some(work_tree) = self.work_tree.as_deref() {
+            if !index.suppress_pre_write_index_housekeeping {
+                crate::untracked_cache::ensure_untracked_cache_shell(
+                    index,
+                    work_tree,
+                    cfg.as_ref(),
+                );
+                if !index.skip_racy_smudge_on_write {
+                    crate::diff::smudge_racily_clean_entries(
+                        &self.odb,
+                        &self.git_dir,
+                        index,
+                        work_tree,
+                        prev_index_mtime,
+                        Some(cfg.as_ref()),
+                        Some(self.caches().filters()),
+                    );
+                }
+            }
+        }
+        index.clear_content_verified();
+        let skip_hash = crate::index::index_skip_hash_for_write(Some(cfg.as_ref()));
+        Ok((skip_hash, cfg))
+    }
+
+    fn write_index_file(
+        &self,
+        path: &std::path::Path,
+        index: &mut Index,
+        split: WriteSplitIndexRequest,
+        updated_workdir: bool,
+        updated_skipworktree: bool,
+        existing_lock: Option<&mut crate::index::IndexLock>,
+    ) -> Result<()> {
+        crate::trace::trace_span!("grit.index.write");
+        let (skip_hash, cfg) = self.prepare_index_for_disk_write(path, index)?;
+        self.odb.flush_for_publish()?;
+        write_index_file_split(
+            path,
+            &self.git_dir,
+            index,
+            cfg.as_ref(),
+            split,
+            skip_hash,
+            self.thread_policy(),
+            existing_lock,
+            true,
+        )
+        .map_err(|err| map_index_write_error(&self.git_dir, path, err))?;
+        // Git `write_locked_index`: `post-index-change` after a successful index write (t1800).
+        let updated_workdir_arg = if updated_workdir { "1" } else { "0" };
+        let updated_skipworktree_arg = if updated_skipworktree { "1" } else { "0" };
+        let _ = run_hook(
+            self,
+            "post-index-change",
+            &[updated_workdir_arg, updated_skipworktree_arg],
+            None,
+        );
+        Ok(())
+    }
+
+    fn finalize_sparse_index_if_needed(&self, index: &mut Index) -> Result<()> {
+        let cfg = self
+            .config()
+            .snapshot()
+            .unwrap_or_else(|_| Arc::new(ConfigSet::new()));
+        let sparse_enabled = cfg
+            .value("core.sparseCheckout")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if !sparse_enabled {
+            index.sparse_directories = false;
+            return Ok(());
+        }
+        let cone_cfg = cfg
+            .value("core.sparseCheckoutCone")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+        let sparse_ix = cfg
+            .value("index.sparse")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let patterns = read_sparse_checkout_patterns(&self.git_dir);
+        let cone = effective_cone_mode_for_sparse_file(cone_cfg, &patterns);
+        // Checkout writes the index before moving HEAD; a valid cache-tree root names the tree
+        // the index already matches.
+        let tree_oid = match index.cache_tree_root {
+            Some(tree) => Some(tree),
+            None => crate::state::resolve_head_for_repository(self)?.tree(&self.odb)?,
+        };
+        if let Some(t) = tree_oid {
+            let protect = crate::path_validate::ProtectOptions::from_config(cfg.as_ref());
+            index.try_collapse_sparse_directories(
+                &self.odb, &t, &patterns, cone, sparse_ix, protect,
+            )?;
+        } else {
+            index.sparse_directories = false;
+        }
+        Ok(())
+    }
+
+    /// Relative path from the work tree root to the process current directory, `/`-separated.
+    ///
+    /// Used for `:(top)` / `:/` pathspec Bloom lookups. Returns `None` for bare repositories or
+    /// when paths cannot be resolved; callers should treat `None` like an empty prefix.
+    #[must_use]
+    pub(crate) fn bloom_pathspec_cwd(&self) -> Option<String> {
+        let wt = self.work_tree.as_ref()?;
+        let cwd = self.environment.discovery_cwd();
+        let wt = wt.canonicalize_simplified().ok()?;
+        let cwd = cwd.canonicalize_simplified().ok()?;
+        let rel = cwd.strip_prefix(&wt).ok()?;
+        let s = rel.to_string_lossy().replace('\\', "/");
+        let s = s.trim_start_matches('/').to_string();
+        Some(s)
+    }
+
+    /// Whether this handle has no working tree, matching `git rev-parse --is-bare-repository`.
+    ///
+    /// When `core.bare` is explicitly `false`, this is always `false` (even without a work tree).
+    /// Otherwise it is `true` only when [`Repository::work_tree`](Self::work_tree) is `None`.
+    /// A linked checkout of a bare repository therefore returns `false` while the bare git dir
+    /// opened without a work tree stays `true`.
+    #[must_use]
+    pub fn is_bare(&self) -> bool {
+        if let Ok(cfg) = self.config().snapshot() {
+            if !cfg.bool_with_default("core.bare", true) {
+                return false;
+            }
+        }
+        self.work_tree.is_none()
+    }
+
+    /// Ref prefix holding replace refs (`refs/replace/` unless `GIT_REPLACE_REF_BASE` says
+    /// otherwise), or `None` when `GIT_NO_REPLACE_OBJECTS` or `core.useReplaceRefs=false`
+    /// disables them.
+    pub(crate) fn replace_ref_base_if_enabled(&self) -> Option<String> {
+        if self.environment.git_no_replace_objects {
+            return None;
+        }
+        let settings = self.cached_settings();
+        settings
+            .use_replace_refs
+            .then_some(settings.replace_ref_base)
+    }
+
+    /// Object id to use after applying `refs/replace` (when enabled).
+    pub(crate) fn object_id_after_replace(
+        &self,
+        oid: &crate::objects::ObjectId,
+    ) -> crate::objects::ObjectId {
+        self.resolve_replace_redirect(oid).unwrap_or(*oid)
+    }
+
+    /// Metadata for an object, following replace refs without reading the payload.
+    pub(crate) fn read_info_replaced(
+        &self,
+        oid: &crate::objects::ObjectId,
+    ) -> Result<crate::objects::ObjectInfo> {
+        let effective = self.object_id_after_replace(oid);
+        self.odb.read_info(&effective)
+    }
+
+    /// Read an object, transparently following replace refs.
+    ///
+    /// If `refs/replace/<hex>` exists for the requested OID and
+    /// `GIT_NO_REPLACE_OBJECTS` is **not** set, this reads the
+    /// replacement object instead.  Otherwise it behaves identically
+    /// to `self.odb.read(oid)`.
+    pub(crate) fn read_replaced(
+        &self,
+        oid: &crate::objects::ObjectId,
+    ) -> Result<crate::objects::Object> {
+        let effective = self.object_id_after_replace(oid);
+        self.odb.read(&effective)
+    }
+
+    fn resolve_replace_redirect(
+        &self,
+        oid: &crate::objects::ObjectId,
+    ) -> Option<crate::objects::ObjectId> {
+        if self.environment.git_no_replace_objects {
+            return None;
+        }
+        if let Ok(guard) = self.config_session.lock() {
+            if guard.as_ref().is_some_and(|s| s.replace_lookup_inactive) {
+                return None;
+            }
+        }
+        let settings = self.cached_settings();
+        if !settings.use_replace_refs {
+            return None;
+        }
+        let mut slot = self
+            .caches
+            .replace_redirects()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(load_replace_redirect_map(self));
+        }
+        slot.as_ref()?.get(oid).copied()
+    }
+
+    /// Raw commit bytes for history traversal at `oid`, honoring `refs/replace`.
+    pub(crate) fn read_commit_bytes_with_replace(&self, oid: &ObjectId) -> Result<Vec<u8>> {
+        let effective = self.object_id_after_replace(oid);
+        let object = self.odb.read(&effective)?;
+        if object.kind != ObjectKind::Commit {
+            return Err(Error::UnexpectedObjectKind {
+                oid: effective,
+                expected: ObjectKind::Commit,
+                actual: object.kind,
+            });
+        }
+        Ok(object.data)
+    }
+
+    /// Parsed commit for history traversal at `oid`, honoring `refs/replace`.
+    pub(crate) fn read_commit_with_replace(&self, oid: &ObjectId) -> Result<CommitData> {
+        parse_commit(&self.read_commit_bytes_with_replace(oid)?)
+    }
+}
+
+fn load_replace_redirect_map(repo: &Repository) -> crate::objects::OidHashMap<ObjectId> {
+    use crate::objects::oid_hash_map;
+    use std::collections::HashSet;
+
+    let mut direct = oid_hash_map();
+    let Some(ref_base) = repo.replace_ref_base_if_enabled() else {
+        return direct;
+    };
+    let Ok(refs) = crate::refs::list_refs_for_repository(repo, &ref_base) else {
+        return direct;
+    };
+    for (name, replacement) in refs {
+        let Some(hex) = name.strip_prefix(&ref_base) else {
+            continue;
+        };
+        let Ok(original) = hex.parse::<ObjectId>() else {
+            continue;
+        };
+        if repo.odb().read_info(&replacement).is_ok() {
+            direct.insert(original, replacement);
+        }
+    }
+
+    let mut resolved = oid_hash_map();
+    for &original in direct.keys() {
+        let mut cur = original;
+        let mut seen = HashSet::new();
+        while let Some(&next) = direct.get(&cur) {
+            if !seen.insert(cur) {
+                break;
+            }
+            cur = next;
+        }
+        if cur != original {
+            resolved.insert(original, cur);
+        }
+    }
+    resolved
+}
+
+/// Resolve the common git directory for linked worktrees.
+fn resolve_common_dir(git_dir: &Path) -> Option<PathBuf> {
+    let commondir_file = git_dir.join("commondir");
+    if !commondir_file.is_file() {
+        return None;
+    }
+    let common_raw = fs::read_to_string(commondir_file).ok()?;
+    let common_rel = common_raw.trim();
+    if common_rel.is_empty() {
+        return None;
+    }
+    let common_dir = if Path::new(common_rel).is_absolute() {
+        PathBuf::from(common_rel)
+    } else {
+        git_dir.join(common_rel)
+    };
+    Some(common_dir.canonicalize_simplified().unwrap_or(common_dir))
+}
+
+/// Directory holding `config` for early-config reads (`commondir` when present).
+#[must_use]
+pub fn common_git_dir_for_config(git_directory: &Path) -> PathBuf {
+    resolve_common_dir(git_directory).unwrap_or_else(|| git_directory.to_path_buf())
+}
+
+/// True when `extensions.worktreeConfig` is enabled in the common `config`.
+pub fn worktree_config_enabled(git_directory: &Path) -> bool {
+    let path = git_directory.join("config");
+    let Ok(content) = crate::repo_caches::read_local_config_file(&path) else {
+        return false;
+    };
+    worktree_config_enabled_for_text(Some(content.as_str()))
+}
+
+/// Like [`worktree_config_enabled`] when `config` body is already in memory.
+pub fn worktree_config_enabled_for_text(content: Option<&str>) -> bool {
+    let Some(content) = content else {
+        return false;
+    };
+    let mut in_extensions = false;
+    for raw_line in content.lines() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            let Some(end_idx) = line.find(']') else {
+                continue;
+            };
+            let section = line[1..end_idx].trim();
+            let section_name = section
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            in_extensions = section_name == "extensions";
+            let remainder = line[end_idx + 1..].trim();
+            if remainder.is_empty() || remainder.starts_with('#') || remainder.starts_with(';') {
+                continue;
+            }
+            line = remainder;
+        }
+        if in_extensions {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim().eq_ignore_ascii_case("worktreeconfig") {
+                let v = value.trim();
+                return v.eq_ignore_ascii_case("true")
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("on")
+                    || v == "1";
+            }
+        }
+    }
+    false
+}
+
+fn open_or_create_config_file(path: &Path, scope: ConfigScope) -> Result<ConfigFile> {
+    match ConfigFile::from_path(path, scope)? {
+        Some(f) => Ok(f),
+        None => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(Error::Io)?;
+            }
+            ConfigFile::parse(path, "", scope)
+        }
+    }
+}
+
+fn config_file_bool_true(cfg: &ConfigFile, key: &str) -> bool {
+    cfg.get(key).is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "on" | "1"
+        )
+    })
+}
+
+/// Enable per-worktree configuration (`extensions.worktreeConfig`) and create
+/// `config.worktree`, matching Git's `init_worktree_config` in `worktree.c`.
+///
+/// When `core.bare` is true or `core.worktree` is set in the common config,
+/// those keys are moved into `config.worktree` so linked worktrees keep working.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] or [`Error::Config`] if config files cannot be read or written.
+pub fn init_worktree_config(git_directory: &Path) -> Result<()> {
+    let common_dir = common_git_dir_for_config(git_directory);
+    let common_config_path = common_dir.join("config");
+    let worktree_config_path = git_directory.join("config.worktree");
+
+    if worktree_config_enabled(&common_dir) {
+        if !worktree_config_path.exists() {
+            if let Some(parent) = worktree_config_path.parent() {
+                fs::create_dir_all(parent).map_err(Error::Io)?;
+            }
+            fs::write(&worktree_config_path, "").map_err(Error::Io)?;
+        }
+        return Ok(());
+    }
+
+    let mut common_cfg = open_or_create_config_file(&common_config_path, ConfigScope::Local)?;
+    common_cfg.set("extensions.worktreeConfig", "true")?;
+
+    let mut wt_cfg = open_or_create_config_file(&worktree_config_path, ConfigScope::Worktree)?;
+
+    if config_file_bool_true(&common_cfg, "core.bare") {
+        wt_cfg.set("core.bare", "true")?;
+        common_cfg.unset("core.bare")?;
+    }
+    if let Some(worktree) = common_cfg.get("core.worktree") {
+        wt_cfg.set("core.worktree", &worktree)?;
+        common_cfg.unset("core.worktree")?;
+    }
+
+    common_cfg.write()?;
+    wt_cfg.write()?;
+    Ok(())
+}
+
+/// If the common `config` declares a repository format newer than Git's
+/// `GIT_REPO_VERSION_READ`, return the human message Git prints for
+/// `discover_git_directory_reason` / t1309.
+pub fn early_config_ignore_repo_reason(git_directory: &Path) -> Option<String> {
+    let path = git_directory.join("config");
+    let content = crate::repo_caches::read_local_config_file(&path).ok()?;
+    early_config_ignore_repo_reason_for_text(Some(content.as_str()))
+}
+
+/// Like [`early_config_ignore_repo_reason`] when `config` body is already in memory.
+pub fn early_config_ignore_repo_reason_for_text(content: Option<&str>) -> Option<String> {
+    const GIT_REPO_VERSION_READ: u32 = 1;
+    let content = content?;
+    let mut version = 0u32;
+    let mut in_core = false;
+    for raw_line in content.lines() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            let Some(end_idx) = line.find(']') else {
+                continue;
+            };
+            let section = line[1..end_idx].trim();
+            let section_name = section
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            in_core = section_name == "core";
+            let remainder = line[end_idx + 1..].trim();
+            if remainder.is_empty() || remainder.starts_with('#') || remainder.starts_with(';') {
+                continue;
+            }
+            line = remainder;
+        }
+        if in_core {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("repositoryformatversion") {
+                    if let Ok(v) = value.trim().parse::<u32>() {
+                        version = v;
+                    }
+                }
+            }
+        }
+    }
+    if version > GIT_REPO_VERSION_READ {
+        Some(format!(
+            "Expected git repo version <= {GIT_REPO_VERSION_READ}, found {version}"
+        ))
+    } else {
+        None
+    }
+}
+
+fn path_for_ceiling_compare(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.into_owned()
+    }
+}
+
+fn offset_1st_component(path: &str) -> usize {
+    if path.starts_with('/') {
+        1
+    } else {
+        0
+    }
+}
+
+/// Git `longest_ancestor_length`: longest strict ancestor prefix among ceilings.
+fn longest_ancestor_length(path: &str, ceilings: &[String]) -> Option<usize> {
+    if path == "/" {
+        return None;
+    }
+    let mut max_len: Option<usize> = None;
+    for ceil in ceilings {
+        let mut len = ceil.len();
+        while len > 0 && ceil.as_bytes().get(len - 1) == Some(&b'/') {
+            len -= 1;
+        }
+        if len == 0 {
+            continue;
+        }
+        if path.len() <= len + 1 {
+            continue;
+        }
+        if !path.starts_with(&ceil[..len]) {
+            continue;
+        }
+        if path.as_bytes().get(len) != Some(&b'/') {
+            continue;
+        }
+        if path.as_bytes().get(len + 1).is_none() {
+            continue;
+        }
+        max_len = Some(max_len.map_or(len, |m| m.max(len)));
+    }
+    max_len
+}
+
+/// Path to the repository-local config file (`.git/config`, or `commondir/config` for a linked
+/// worktree admin directory that has no separate `config` file).
+///
+/// Used when writing `git config --local` semantics from library code.
+pub fn local_config_write_path(git_directory: &Path) -> PathBuf {
+    if let Some(path) = repository_config_path(git_directory) {
+        return path;
+    }
+    if let Some(common) = resolve_common_dir(git_directory) {
+        return common.join("config");
+    }
+    git_directory.join("config")
+}
+
+/// Determine the config file path for a repository or linked worktree.
+fn repository_config_path(git_dir: &Path) -> Option<PathBuf> {
+    repository_config_path_for_caches(git_dir)
+}
+
+/// Same as [`repository_config_path`] for [`crate::repo_caches::RepoCaches`].
+pub(crate) fn repository_config_path_for_caches(git_dir: &Path) -> Option<PathBuf> {
+    let local = git_dir.join("config");
+    if local.is_file() {
+        return Some(local);
+    }
+    let commondir = git_dir.join("commondir");
+    if !commondir.is_file() {
+        return None;
+    }
+    let common = resolve_common_dir(git_dir)?;
+    let shared = common.join("config");
+    if shared.exists() {
+        Some(shared)
+    } else {
+        None
+    }
+}
+
+/// Validate core repository format/version compatibility.
+///
+/// Supports repository format versions 0 and 1, with extension handling that
+/// matches Git's compatibility expectations in upstream repo-version tests.
+/// Public wrapper for validate_repository_format.
+pub fn validate_repo_format(git_directory: &Path) -> Result<()> {
+    validate_repository_format(git_directory)
+}
+
+/// Validate parsed repository format (version and extensions) before using the repo.
+pub(crate) fn validate_repository_format_parsed(parsed: &RepositoryFormat) -> Result<()> {
+    if parsed.repo_version > 1 {
+        return Err(RepositoryError::UnsupportedRepositoryFormatVersion {
+            version: parsed.repo_version,
+        }
+        .into());
+    }
+
+    if let Some(raw) = parsed.ref_storage.as_deref() {
+        crate::ref_storage::RefStorageFormat::validate_config_extension(raw)?;
+    }
+
+    if let Some(err) = parsed.repository_extension_error() {
+        return Err(err.into());
+    }
+
+    Ok(())
+}
+
+fn validate_repository_format(git_dir: &Path) -> Result<()> {
+    let Some(config_path) = repository_config_path(git_dir) else {
+        return Ok(());
+    };
+    let content = crate::repo_caches::read_local_config_file(&config_path)?;
+    let parsed = parse_repository_format(&content, &config_path)?;
+    validate_repository_format_parsed(&parsed)
+}
+
+/// The result of parsing `core.repositoryformatversion` and `extensions.*` from a
+/// repository's `config` file, using Git-compatible format parsing.
+#[derive(Clone)]
+pub(crate) struct RepositoryFormat {
+    /// Declared `core.repositoryformatversion` (defaults to 0; invalid values ignored).
+    pub(crate) repo_version: u32,
+    /// All extension keys (lowercased) declared under `[extensions]`.
+    pub(crate) extensions: BTreeSet<String>,
+    /// Raw value of `extensions.refstorage`, if present.
+    pub(crate) ref_storage: Option<String>,
+    /// Raw value of `extensions.objectformat`, if present.
+    pub(crate) object_format: Option<String>,
+}
+
+/// Parse repository format from repository-local config (no global/system config).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] or [`Error::Config`] when config cannot be read or parsed.
+pub(crate) fn read_repository_format_from_git_dir(git_dir: &Path) -> Result<RepositoryFormat> {
+    let Some(config_path) = repository_config_path(git_dir) else {
+        return Ok(RepositoryFormat {
+            repo_version: 0,
+            extensions: BTreeSet::new(),
+            ref_storage: None,
+            object_format: None,
+        });
+    };
+    let content = crate::repo_caches::read_local_config_file(&config_path)?;
+    parse_repository_format(&content, &config_path)
+}
+
+impl RepositoryFormat {
+    /// Object hash algorithm declared by `extensions.objectformat`, SHA-1 when absent or
+    /// unrecognized (the same fallback as [`crate::odb::hash_algo_for_git_dir`]).
+    pub(crate) fn hash_algo(&self) -> crate::objects::HashAlgo {
+        self.object_format
+            .as_deref()
+            .and_then(crate::objects::HashAlgo::from_name)
+            .unwrap_or(crate::objects::HashAlgo::Sha1)
+    }
+
+    /// Build git's `verify_repository_format` warning/error message for unsupported
+    /// extension declarations, or `None` if the extensions are all acceptable.
+    ///
+    /// This does not cover the `core.repositoryformatversion > 1` case; callers that
+    /// need the version message handle it separately via
+    /// [`repository_format_warning`].
+    /// Typed extension validation failure, if any (Git `verify_repository_format` rules).
+    fn repository_extension_error(&self) -> Option<RepositoryError> {
+        // Mirror git/setup.c `check_repo_format` / `verify_repository_format`. Extensions
+        // split into:
+        //   * v0-compatible (`handle_extension_v0`): respected even in a v0 repository.
+        //   * v1-only (`handle_extension`): legal only when `core.repositoryformatversion >= 1`.
+        // A v0 repository that declares any v1-only extension is rejected (t0001 #60, #62);
+        // an unknown extension is rejected only in a v1 repository.
+        let mut v1_only_found: Vec<String> = Vec::new();
+        let mut unknown_found: Vec<String> = Vec::new();
+        for extension in &self.extensions {
+            match extension.as_str() {
+                "noop" | "preciousobjects" | "partialclone" | "worktreeconfig" => {}
+                "noop-v1"
+                | "objectformat"
+                | "compatobjectformat"
+                | "refstorage"
+                | "relativeworktrees"
+                | "submodulepathconfig" => {
+                    if self.repo_version == 0 {
+                        v1_only_found.push(extension.clone());
+                    }
+                }
+                _ => {
+                    if self.repo_version >= 1 {
+                        unknown_found.push(extension.clone());
+                    }
+                }
+            }
+        }
+
+        if !unknown_found.is_empty() {
+            return Some(RepositoryError::UnknownRepositoryExtensions(
+                error::UnknownRepositoryExtensions {
+                    extensions: unknown_found,
+                },
+            ));
+        }
+
+        if !v1_only_found.is_empty() {
+            return Some(RepositoryError::V1OnlyExtensionsInFormatZero(
+                error::V1OnlyExtensionsInFormatZero {
+                    extensions: v1_only_found,
+                },
+            ));
+        }
+
+        None
+    }
+
+    fn format_error_message(&self) -> Option<String> {
+        self.repository_extension_error().map(|err| err.to_string())
+    }
+}
+
+/// Parse `core.repositoryformatversion` and `[extensions]` entries out of raw
+/// `config` file contents.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if a section header is malformed (no closing `]`).
+pub(crate) fn parse_repository_format(
+    content: &str,
+    config_path: &Path,
+) -> Result<RepositoryFormat> {
+    let mut in_core = false;
+    let mut in_extensions = false;
+    let mut repo_version = 0u32;
+    let mut extensions = BTreeSet::new();
+    let mut ref_storage: Option<String> = None;
+    let mut object_format: Option<String> = None;
+
+    for (line_idx, raw_line) in content.lines().enumerate() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        if line.starts_with('[') {
+            let Some(end_idx) = line.find(']') else {
+                return Err(Error::Config(ConfigError::BadConfigLineInFile {
+                    file: config_path.display().to_string(),
+                    line: line_idx + 1,
+                }));
+            };
+
+            let section = line[1..end_idx].trim();
+            let section_name = section
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            in_core = section_name == "core";
+            in_extensions = section_name == "extensions";
+
+            let remainder = line[end_idx + 1..].trim();
+            if remainder.is_empty() || remainder.starts_with('#') || remainder.starts_with(';') {
+                continue;
+            }
+            line = remainder;
+        }
+
+        if in_core {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("repositoryformatversion") {
+                    // Match Git's `read_repository_format`: bad values are ignored (version stays 0).
+                    if let Ok(v) = value.trim().parse::<u32>() {
+                        repo_version = v;
+                    }
+                }
+            }
+        }
+
+        if in_extensions {
+            let (key, value) = if let Some((key, value)) = line.split_once('=') {
+                (key.trim(), Some(value.trim()))
+            } else {
+                (line, None)
+            };
+            if key.eq_ignore_ascii_case("refstorage") {
+                ref_storage = value.map(str::to_owned);
+            }
+            if key.eq_ignore_ascii_case("objectformat") {
+                object_format = value.map(str::to_owned);
+            }
+            if !key.is_empty() {
+                extensions.insert(key.to_ascii_lowercase());
+            }
+        }
+    }
+
+    Ok(RepositoryFormat {
+        repo_version,
+        extensions,
+        ref_storage,
+        object_format,
+    })
+}
+
+/// Return the warning message git would print for a repository whose `config`
+/// declares an unsupported format, or `None` if the format is acceptable.
+///
+/// This matches Git's repository-format verification behavior:
+/// commands that run with `RUN_SETUP_GENTLY` (e.g. `git config`) emit this text as a
+/// `warning:` and then behave as if no repository were present, which makes the command
+/// fail with a non-zero exit. The returned string is the bare message without the
+/// `warning: ` prefix.
+///
+/// `git_dir` is the resolved git directory; its `config` (or the common-dir `config` for
+/// linked worktrees) is parsed. A missing config yields `None` (git treats it as ok).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the config file exists but cannot be read, or
+/// [`Error::Config`] if a section header is malformed.
+pub fn repository_format_warning(git_directory: &Path) -> Result<Option<String>> {
+    const GIT_REPO_VERSION_READ: u32 = 1;
+    let Some(config_path) = repository_config_path(git_directory) else {
+        return Ok(None);
+    };
+    let content = fs::read_to_string(&config_path).map_err(Error::Io)?;
+    let parsed = parse_repository_format(&content, &config_path)?;
+
+    if parsed.repo_version > GIT_REPO_VERSION_READ {
+        return Ok(Some(format!(
+            "Expected git repo version <= {GIT_REPO_VERSION_READ}, found {}",
+            parsed.repo_version
+        )));
+    }
+
+    Ok(parsed.format_error_message())
+}
+
+/// Try to open a repository rooted exactly at `dir`.
+///
+/// Returns `Ok(None)` when `dir` is not a repository root (the caller should
+/// walk up); returns `Err` on a structural problem.
+/// Result of probing a single directory during [`Repository::discover`].
+struct DiscoveredAt {
+    repo: Repository,
+    /// When discovery used a `.git` gitfile, the path to that file (for ownership checks).
+    gitfile: Option<PathBuf>,
+}
+
+fn try_open_at(options: &RepositoryOptions, dir: &Path) -> Result<Option<DiscoveredAt>> {
+    let env = &options.environment;
+    let dot_git = dir.join(".git");
+
+    // Check for special file types (FIFO, socket, etc.) — reject them
+    // instead of walking up to a parent repository.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let is_special = |ft: fs::FileType| {
+            ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device()
+        };
+        if let Ok(meta) = fs::symlink_metadata(&dot_git) {
+            let ft = meta.file_type();
+            let target_special = ft.is_symlink()
+                && fs::metadata(&dot_git).is_ok_and(|target| is_special(target.file_type()));
+            if is_special(ft) || target_special {
+                return Err(RepositoryError::NotARepository(
+                    NotARepositoryReason::GitfileNotRegularFile { path: dot_git },
+                )
+                .into());
+            }
+        }
+    }
+
+    if dot_git.is_file() {
+        // gitfile indirection: file contains "gitdir: <path>"
+        let git_dir = resolve_gitfile(&dot_git)?;
+        let mut opts = options.clone();
+        opts.validate_repository_format = false;
+        opts.work_tree = Some(dir.to_path_buf());
+        let mut repo = Repository::open_internal(&opts, &git_dir)?;
+        // Linked worktree: `core.worktree` in the common config may point at another directory
+        // (t1501). When the process cwd is not inside that configured tree, Git uses the
+        // discovery directory as the work tree (commondir overrides for ops under the real tree).
+        if resolve_common_dir(&git_dir).is_some() {
+            let cwd = env.discovery_cwd();
+            if repo.work_tree.is_some() && !is_inside_work_tree(&repo, &cwd) {
+                let root = if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    cwd.join(dir)
+                };
+                repo.work_tree = Some(root.canonicalize_simplified().unwrap_or(root));
+            }
+        }
+        let root = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            env.discovery_cwd().join(dir)
+        };
+        repo.discovery_root = Some(root.canonicalize_simplified().unwrap_or(root));
+        repo.discovery_via_gitfile = true;
+        return Ok(Some(DiscoveredAt {
+            repo,
+            gitfile: Some(dot_git.clone()),
+        }));
+    }
+
+    if dot_git.is_dir() {
+        // If .git is a symlink to a directory, resolve the symlink target
+        // for validation but keep the original .git path for user-facing output
+        // (matches real git behavior: `rev-parse --git-dir` shows `.git`).
+        let open_path = if dot_git.is_symlink() {
+            // Resolve the symlink target for validation
+            dot_git.read_link().unwrap_or_else(|_| dot_git.clone())
+        } else {
+            dot_git.clone()
+        };
+        // Try to open; if the directory is empty or invalid, continue
+        // walking up (e.g. an empty .git/ directory should be ignored).
+        let mut skip_opts = options.clone();
+        skip_opts.validate_repository_format = false;
+        skip_opts.work_tree = Some(dir.to_path_buf());
+        match Repository::open_internal(&skip_opts, &open_path) {
+            Ok(mut repo) => {
+                // Restore the original path so rev-parse shows .git not the
+                // resolved symlink target.
+                if dot_git.is_symlink() {
+                    let abs_dot_git = if dot_git.is_absolute() {
+                        dot_git
+                    } else {
+                        dir.join(".git")
+                    };
+                    repo.git_dir = abs_dot_git;
+                }
+                let root = if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    env.discovery_cwd().join(dir)
+                };
+                repo.discovery_root = Some(root.canonicalize_simplified().unwrap_or(root));
+                repo.discovery_via_gitfile = false;
+                return Ok(Some(DiscoveredAt {
+                    repo,
+                    gitfile: None,
+                }));
+            }
+            Err(Error::Repository(RepositoryError::NotARepository(_))) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Linked-worktree gitdir/admin directories contain HEAD and commondir,
+    // and can be opened as repositories even without a local objects/ dir.
+    if dir.join("HEAD").is_file() && dir.join("commondir").is_file() {
+        let repo = Repository::open_with_work_tree(options, dir, None)?;
+        return Ok(Some(DiscoveredAt {
+            repo,
+            gitfile: None,
+        }));
+    }
+
+    // Check if `dir` itself is a bare repo (has objects/ and HEAD directly)
+    if dir.join("objects").is_dir() && dir.join("HEAD").is_file() {
+        // Check safe.bareRepository policy before opening bare repos.
+        // When set to "explicit", implicit bare repo discovery is forbidden
+        // unless GIT_DIR was set (handled earlier in discover()).
+        if !is_inside_dot_git(dir) {
+            if let Ok(cfg) = crate::config::ConfigSet::load(
+                env,
+                None,
+                &crate::config::LoadConfigOptions::standard(env, None),
+            ) {
+                if let Some(val) = cfg.value("safe.bareRepository") {
+                    if val.eq_ignore_ascii_case("explicit") {
+                        return Err(RepositoryError::ForbiddenBareRepository {
+                            path: path_for_error_message(dir),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+        let repo = Repository::open_with_work_tree(options, dir, None)?;
+        return Ok(Some(DiscoveredAt {
+            repo,
+            gitfile: None,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn is_inside_dot_git(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == ".git")
+}
+
+/// Collect effective `safe.directory` values from protected config (system/global/command),
+/// applying empty-value resets like Git.
+fn safe_directory_effective_values(git_dir: &Path, env: &Environment) -> Vec<String> {
+    let cfg = crate::config::ConfigSet::load(
+        env,
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::standard(env, Some(git_dir)),
+    )
+    .unwrap_or_else(|_| crate::config::ConfigSet::new());
+    let mut values: Vec<String> = Vec::new();
+    for e in cfg.entries() {
+        if e.key == "safe.directory"
+            && e.scope != crate::config::ConfigScope::Local
+            && e.scope != crate::config::ConfigScope::Worktree
+        {
+            values.push(e.value.clone().unwrap_or_else(|| "true".to_owned()));
+        }
+    }
+    let mut effective: Vec<String> = Vec::new();
+    for v in values {
+        if v.is_empty() {
+            effective.clear();
+        } else {
+            effective.push(v);
+        }
+    }
+    effective
+}
+
+fn ensure_safe_directory_allows(
+    git_dir: &Path,
+    checked: &Path,
+    environment: &Environment,
+) -> Result<()> {
+    let effective = safe_directory_effective_values(git_dir, environment);
+    let checked_s = checked.to_string_lossy().to_string();
+    if effective
+        .iter()
+        .any(|v| safe_directory_matches(v, &checked_s, &environment.discovery_cwd()))
+    {
+        return Ok(());
+    }
+    Err(RepositoryError::DubiousOwnership {
+        path: path_for_error_message(checked),
+        owner_uid: None,
+        effective_uid: None,
+    }
+    .into())
+}
+
+fn path_owned(
+    ownership_check: &dyn crate::ownership_check::OwnershipCheck,
+    context: &crate::ownership_check::OwnershipContext,
+    path: &Path,
+    missing_worktree_is_owned: bool,
+) -> Result<bool> {
+    use crate::ownership_check::{OwnershipError, OwnershipStatus};
+    match ownership_check.status(path, context) {
+        Ok(OwnershipStatus::Owned) => Ok(true),
+        Ok(OwnershipStatus::NotOwned) => Ok(false),
+        Err(OwnershipError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            if missing_worktree_is_owned {
+                Ok(true)
+            } else {
+                Err(Error::Io(source))
+            }
+        }
+        Err(OwnershipError::Io { source, .. }) => Err(Error::Io(source)),
+    }
+}
+
+/// Match Git's `ensure_valid_ownership`: check gitfile, worktree, and gitdir ownership,
+/// then `safe.directory` when any path is not owned by the effective user.
+fn ensure_valid_ownership(
+    ownership_check: &dyn crate::ownership_check::OwnershipCheck,
+    environment: &Environment,
+    gitfile: Option<&Path>,
+    worktree: Option<&Path>,
+    gitdir: &Path,
+) -> Result<()> {
+    let context = crate::ownership_check::OwnershipContext::from_environment(environment);
+    if !ownership_check.always_apply_safe_directory() {
+        let gitfile_ok = gitfile
+            .map(|p| path_owned(ownership_check, &context, p, false))
+            .transpose()?
+            .unwrap_or(true);
+        let wt_ok = match worktree {
+            None => true,
+            Some(wt) => path_owned(ownership_check, &context, wt, true)?,
+        };
+        let gd_ok = path_owned(ownership_check, &context, gitdir, false)?;
+        if gitfile_ok && wt_ok && gd_ok {
+            return Ok(());
+        }
+    }
+
+    let data_path = if let Some(wt) = worktree {
+        wt.canonicalize_simplified()
+            .unwrap_or_else(|_| wt.to_path_buf())
+    } else {
+        gitdir
+            .canonicalize_simplified()
+            .unwrap_or_else(|_| gitdir.to_path_buf())
+    };
+    ensure_safe_directory_allows(gitdir, &data_path, environment)
+}
+
+impl Repository {
+    /// Enforce `safe.directory` ownership checks, matching upstream behavior.
+    ///
+    /// When the installed [`crate::ownership_check::OwnershipCheck`] sets
+    /// [`crate::ownership_check::OwnershipCheck::always_apply_safe_directory`], ownership is considered unsafe
+    /// unless a matching `safe.directory` value is configured in system/global/
+    /// command scopes (repository-local config is ignored).
+    pub fn enforce_safe_directory(&self) -> Result<()> {
+        if !self.ownership_check.always_apply_safe_directory() {
+            return Ok(());
+        }
+
+        if self.explicit_git_dir {
+            return Ok(());
+        }
+
+        // In normal discovery, ownership is checked against worktree paths
+        // unless invocation starts inside the gitdir, in which case gitdir is
+        // checked.
+        let checked = if let Some(wt) = &self.work_tree {
+            let cwd = Some(self.environment.discovery_cwd());
+            if let Some(cwd) = cwd {
+                if cwd
+                    .canonicalize_simplified()
+                    .ok()
+                    .is_some_and(|c| c.starts_with(&self.git_dir))
+                {
+                    self.git_dir
+                        .canonicalize_simplified()
+                        .unwrap_or_else(|_| self.git_dir.clone())
+                } else {
+                    wt.canonicalize_simplified().unwrap_or_else(|_| wt.clone())
+                }
+            } else {
+                wt.canonicalize_simplified().unwrap_or_else(|_| wt.clone())
+            }
+        } else {
+            self.git_dir
+                .canonicalize_simplified()
+                .unwrap_or_else(|_| self.git_dir.clone())
+        };
+
+        self.enforce_safe_directory_checked(&checked)
+    }
+
+    /// Enforce safe.directory checks using the repository git-dir path.
+    ///
+    /// Used by operations that explicitly open another repository by path
+    /// (e.g. local clone source).
+    pub(crate) fn enforce_safe_directory_git_dir(&self) -> Result<()> {
+        if !self.ownership_check.always_apply_safe_directory() {
+            return Ok(());
+        }
+        let checked = self
+            .git_dir
+            .canonicalize_simplified()
+            .unwrap_or_else(|_| self.git_dir.clone());
+        self.enforce_safe_directory_checked(&checked)
+    }
+
+    fn enforce_safe_directory_checked(&self, checked: &Path) -> Result<()> {
+        ensure_safe_directory_allows(&self.git_dir, checked, self.environment.as_ref())
+    }
+
+    /// Verify the repository is safe to use as a `git clone` source (local clone).
+    ///
+    /// When the ownership check sets
+    /// [`crate::ownership_check::OwnershipCheck::always_apply_safe_directory`],
+    /// applies the same `safe.directory` rules as discovery. Otherwise checks filesystem
+    /// ownership of the git directory only (matching Git's `die_upon_dubious_ownership`
+    /// for clone).
+    pub fn verify_safe_for_clone_source(&self) -> Result<()> {
+        if self.ownership_check.always_apply_safe_directory() {
+            self.enforce_safe_directory_git_dir()
+        } else {
+            ensure_valid_ownership(
+                self.ownership_check.as_ref(),
+                self.environment.as_ref(),
+                None,
+                None,
+                &self.git_dir,
+            )
+        }
+    }
+}
+
+fn normalize_fs_path(raw: &str) -> String {
+    use std::path::Component;
+    let p = std::path::Path::new(raw);
+    let mut parts: Vec<String> = Vec::new();
+    let mut absolute = false;
+    for c in p.components() {
+        match c {
+            Component::RootDir => {
+                absolute = true;
+                parts.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !parts.is_empty() {
+                    parts.pop();
+                }
+            }
+            Component::Normal(s) => parts.push(s.to_string_lossy().to_string()),
+            Component::Prefix(_) => {}
+        }
+    }
+    let mut out = if absolute {
+        String::from("/")
+    } else {
+        String::new()
+    };
+    out.push_str(&parts.join("/"));
+    out
+}
+
+fn safe_directory_matches(config_value: &str, checked: &str, cwd: &Path) -> bool {
+    if config_value == "*" {
+        return true;
+    }
+    if config_value == "." {
+        // CWD only.
+        let cwd_s = normalize_fs_path(&cwd.to_string_lossy());
+        let checked_s = normalize_fs_path(checked);
+        return cwd_s == checked_s;
+    }
+
+    let canonicalize_or_normalize = |raw: &str| -> String {
+        let p = std::path::Path::new(raw);
+        if p.exists() {
+            p.canonicalize_simplified()
+                .map(|c| c.to_string_lossy().to_string())
+                .map(|s| normalize_fs_path(&s))
+                .unwrap_or_else(|_| normalize_fs_path(raw))
+        } else {
+            normalize_fs_path(raw)
+        }
+    };
+
+    let config_norm = canonicalize_or_normalize(config_value);
+    let checked_norm = normalize_fs_path(checked);
+
+    if config_norm.ends_with("/*") {
+        let prefix_raw = &config_norm[..config_norm.len() - 2];
+        let prefix_norm = canonicalize_or_normalize(prefix_raw);
+        let mut prefix = prefix_norm;
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        return checked_norm.starts_with(&prefix);
+    }
+
+    config_norm == checked_norm
+}
+
+/// Warn when `repo`'s configuration sets both `core.bare` and `core.worktree`.
+///
+/// Reads the configuration snapshot `repo` just loaded rather than parsing the cascade again.
+fn warn_core_bare_worktree_conflict(options: &RepositoryOptions, repo: &Repository) {
+    if options
+        .environment
+        .git_work_tree
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return;
+    }
+    let Ok(cfg) = repo.ensure_config_arc_fast() else {
+        return;
+    };
+    let bare = cfg.bool_with_default("core.bare", false);
+    let worktree = cfg.value("core.worktree").map(|s| s.to_owned());
+    if bare && worktree.is_some() {
+        options
+            .diagnostics
+            .warn(diagnostics::Warning::CoreBareWithWorktree);
+    }
+}
+
+/// Read `core.bare` and `core.worktree` from a loaded config set.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] when `core.bare` is set to a value that is not a Git boolean.
+pub(crate) fn read_core_bare_and_worktree_from_config(
+    cfg: &ConfigSet,
+) -> Result<(bool, Option<String>)> {
+    let bare = match cfg.get_bool("core.bare") {
+        Ok(None) => false,
+        Ok(Some(v)) => v,
+        Err(e) => return Err(Error::Config(e)),
+    };
+    let worktree = cfg.value("core.worktree").map(|s| s.to_owned());
+    Ok((bare, worktree))
+}
+
+fn read_core_bare_and_worktree(git_dir: &Path) -> Result<(bool, Option<String>)> {
+    let cfg = ConfigSet::load(
+        &crate::environment::Environment::empty(),
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
+    )?;
+    read_core_bare_and_worktree_from_config(&cfg)
+}
+
+/// Reject impossible `GIT_WORK_TREE` values before repository setup (matches Git's
+/// `validate_worktree` / `die` on bogus absolute paths, e.g. t1501).
+fn validate_git_work_tree_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Ok(());
+    }
+    let comps: Vec<Component<'_>> = path.components().collect();
+    let Some(last_normal_idx) = comps
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, c)| matches!(c, Component::Normal(_)).then_some(i))
+    else {
+        return Ok(());
+    };
+    let mut cur = PathBuf::new();
+    for (i, comp) in comps.iter().enumerate() {
+        match comp {
+            Component::Prefix(p) => cur.push(p.as_os_str()),
+            Component::RootDir => cur.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = cur.pop();
+            }
+            Component::Normal(seg) => {
+                cur.push(seg);
+                if i != last_normal_idx && !cur.exists() {
+                    return Err(Error::PathError(format!(
+                        "Invalid path '{}': No such file or directory",
+                        cur.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_core_worktree_path(git_dir: &Path, raw: &str) -> Result<PathBuf> {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return Ok(p
+            .canonicalize_simplified()
+            .unwrap_or_else(|_| p.to_path_buf()));
+    }
+    let joined = git_dir.join(p);
+    Ok(joined.canonicalize_simplified().unwrap_or(joined))
+}
+
+/// When `GIT_DIR` names a gitfile, resolve to the real git directory.
+fn resolve_git_dir_env_path(git_dir: &Path) -> Result<PathBuf> {
+    if git_dir.is_file() {
+        return resolve_gitfile(git_dir);
+    }
+    Ok(git_dir.to_path_buf())
+}
+
+/// Resolve an explicit git directory path the same way as `GIT_DIR` (including gitfile indirection).
+///
+/// # Errors
+///
+/// Returns [`RepositoryError::NotARepository`] for invalid gitfile content.
+pub fn resolve_git_directory_arg(git_directory: &Path) -> Result<PathBuf> {
+    resolve_git_dir_env_path(git_directory)
+}
+
+/// Resolves a work tree's `.git` path (directory or gitfile) to the real git directory.
+///
+/// # Errors
+///
+/// Returns [`RepositoryError::NotARepository`] when `.git` is missing, invalid, or the gitfile target is absent.
+pub fn resolve_dot_git(dot_git: &Path) -> Result<PathBuf> {
+    if dot_git.is_dir() {
+        return dot_git
+            .canonicalize_simplified()
+            .map_err(|_| not_a_repository_at(dot_git));
+    }
+    if dot_git.is_file() {
+        return resolve_gitfile(dot_git);
+    }
+    Err(not_a_repository_at(dot_git))
+}
+
+fn not_a_repository_at(path: &Path) -> Error {
+    RepositoryError::NotARepository(NotARepositoryReason::NoRepositoryAt {
+        path: path.to_path_buf(),
+    })
+    .into()
+}
+
+/// Canonicalize the longest existing prefix of `path` and append the rest unchanged, so a
+/// path that does not exist yet is spelled the same way as its existing parent (through
+/// symlinks such as macOS `/var` -> `/private/var`).
+fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    let mut existing = absolute.as_path();
+    loop {
+        if let Ok(canonical) = existing.canonicalize_simplified() {
+            return Ok(missing
+                .iter()
+                .rev()
+                .fold(canonical, |acc: PathBuf, part| acc.join(part)));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return Ok(absolute),
+        }
+    }
+}
+
+/// The repository's primary objects directory.
+///
+/// [`Environment::git_object_directory`] wins when set (a relative path resolves against
+/// [`Environment::discovery_cwd`]); the main store is then reachable only through alternates,
+/// as in Git. Otherwise `objects/` in `git_dir`, or in `common_git_dir` for a linked
+/// worktree's admin directory.
+///
+/// Returns `None` when the variable is set but empty: Git treats that as a store that cannot
+/// exist, so the repository fails to open.
+fn resolve_objects_dir(
+    environment: &Environment,
+    git_dir: &Path,
+    common_git_dir: &Path,
+) -> Option<PathBuf> {
+    if let Some(dir) = environment.git_object_directory.as_deref() {
+        return (!dir.is_empty()).then(|| environment.discovery_cwd().join(dir));
+    }
+    let own = git_dir.join("objects");
+    Some(if own.exists() {
+        own
+    } else {
+        common_git_dir.join("objects")
+    })
+}
+
+fn head_file_present(git_dir: &Path) -> bool {
+    let head_path = git_dir.join("HEAD");
+    head_path.exists() || head_path.is_symlink()
+}
+
+/// Use `injected` as the repository's ref store (registering it for `git_dir`), or open the
+/// backend the git directory's config selects.
+fn open_or_install_ref_store(
+    caches: &RepoCaches,
+    git_dir: &Path,
+    environment: &Environment,
+    injected: Option<Arc<dyn crate::refs::store::RefStore>>,
+) -> Result<Arc<dyn crate::refs::store::RefStore>> {
+    match injected {
+        Some(store) => {
+            let store = linked_worktree_view(git_dir, store);
+            caches.install_ref_store(git_dir, Arc::clone(&store));
+            Ok(store)
+        }
+        None => caches.open_ref_store(git_dir, environment),
+    }
+}
+
+/// The ref store a handle on `git_dir` uses when its refs live in `store`.
+///
+/// An injected store holds one `HEAD`, the main worktree's. When `git_dir` is a linked
+/// worktree's admin directory the handle instead reads and writes that worktree's own `HEAD`
+/// and `HEAD` reflog in `git_dir`, and every other ref in `store`. Files and reftable stores
+/// already keep per-worktree refs apart and are returned unchanged.
+fn linked_worktree_view(
+    git_dir: &Path,
+    store: Arc<dyn crate::refs::store::RefStore>,
+) -> Arc<dyn crate::refs::store::RefStore> {
+    use crate::refs::store::{LinkedWorktreeRefStore, RefStorageFormat};
+    let on_disk = matches!(
+        store.format(),
+        RefStorageFormat::Files | RefStorageFormat::Reftable
+    );
+    if on_disk || !git_dir.join("commondir").is_file() {
+        return store;
+    }
+    Arc::new(LinkedWorktreeRefStore::new(git_dir.to_path_buf(), store))
+}
+
+/// Read `gitfile` and resolve its `gitdir:` target.
+fn resolve_gitfile(gitfile: &Path) -> Result<PathBuf> {
+    let content = fs::read_to_string(gitfile).map_err(|error| {
+        RepositoryError::NotARepository(NotARepositoryReason::GitfileUnreadable {
+            path: gitfile.to_path_buf(),
+            error,
+        })
+    })?;
+    parse_gitfile(&content, gitfile)
+}
+
+/// Parse the `"gitdir: <path>"` line of `gitfile`'s `content`; a relative target resolves
+/// against the directory containing `gitfile`.
+fn parse_gitfile(content: &str, gitfile: &Path) -> Result<PathBuf> {
+    let Some(target) = content
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+    else {
+        return Err(
+            RepositoryError::NotARepository(NotARepositoryReason::GitfileMissingGitdir {
+                path: gitfile.to_path_buf(),
+            })
+            .into(),
+        );
+    };
+    let path = gitfile
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(target.trim());
+    if !path.exists() {
+        return Err(not_a_repository_at(&path));
+    }
+    Ok(path)
+}
+
+/// Resolve the initial branch name for a new repository.
+///
+/// When `explicit` is `Some`, that name is validated and returned. Otherwise
+/// `init.defaultBranch` is read from the configuration cascade (global/system,
+/// not any repository-local config) and falls back to `main`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidRef`] when the branch name is not a valid short branch name.
+pub fn resolve_initial_branch(env: &Environment, explicit: Option<&str>) -> Result<String> {
+    let name = match explicit {
+        Some(name) => name.to_owned(),
+        None => ConfigSet::load(
+            env,
+            None,
+            &crate::config::LoadConfigOptions::standard(env, None),
+        )?
+        .get_last_entry("init.defaultBranch")
+        .and_then(|e| e.value.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "main".to_owned()),
+    };
+    RefName::branch(&name).map_err(|e| Error::InvalidRef(e.to_string()))?;
+    Ok(name)
+}
+
+fn resolve_git_dir_for_init(path: &Path, options: &InitOptions) -> Result<PathBuf> {
+    if options.bare_with_worktree_at_path || options.bare {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(separate) = &options.separate_git_dir {
+        return Ok(separate.clone());
+    }
+    let dot_git = path.join(".git");
+    if dot_git.is_file() {
+        let content = fs::read_to_string(&dot_git)?;
+        return parse_gitfile(&content, &dot_git);
+    }
+    Ok(dot_git)
+}
+
+/// Branch short name for init outcome reporting; tolerates detached `HEAD` on reinit.
+fn head_branch_name_for_outcome(git_dir: &Path) -> Result<String> {
+    if let Some(target) = crate::refs::read_symbolic_ref(git_dir, "HEAD")? {
+        if let Some(short) = target.strip_prefix("refs/heads/") {
+            return Ok(short.to_owned());
+        }
+        return Ok(target
+            .rsplit('/')
+            .next()
+            .unwrap_or(target.as_str())
+            .to_owned());
+    }
+    let head_text = fs::read_to_string(git_dir.join("HEAD"))?;
+    let oid = head_text.trim();
+    if crate::objects::ObjectId::from_hex(oid).is_ok() {
+        return Ok(crate::objects::short_hex(oid).to_owned());
+    }
+    Ok("HEAD".to_owned())
+}
+
+fn hash_algo_from_git_dir(git_dir: &Path) -> Result<HashAlgo> {
+    let config_path = git_dir.join("config");
+    if !config_path.is_file() {
+        return Ok(HashAlgo::Sha1);
+    }
+    let content = fs::read_to_string(&config_path)?;
+    Ok(parse_repository_format(&content, &config_path)?.hash_algo())
+}
+
+/// Ensure standard git directory layout without overwriting `HEAD`, `config`, or refs.
+fn ensure_git_directory_layout(
+    git_dir: &Path,
+    bare: bool,
+    ref_storage: crate::ref_storage::RefStorageFormat,
+    skip_hooks_and_info: bool,
+) -> Result<()> {
+    let mut subs = vec!["objects", "objects/info", "objects/pack", "refs"];
+    if !ref_storage.is_reftable() {
+        subs.extend(["refs/heads", "refs/tags"]);
+    }
+    if !bare && !skip_hooks_and_info {
+        subs.push("info");
+        subs.push("hooks");
+    }
+    for sub in subs {
+        fs::create_dir_all(git_dir.join(sub))?;
+    }
+
+    if ref_storage.is_reftable() {
+        let reftable_dir = git_dir.join("reftable");
+        fs::create_dir_all(&reftable_dir)?;
+        let tables_list = reftable_dir.join("tables.list");
+        if !tables_list.exists() {
+            fs::write(&tables_list, "")?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_fresh_git_directory(
+    git_dir: &Path,
+    bare: bool,
+    initial_branch: &str,
+    template_dir: Option<&Path>,
+    ref_storage: crate::ref_storage::RefStorageFormat,
+    object_format: HashAlgo,
+    skip_hooks_and_info: bool,
+    init_filesystem: InitFilesystemConfigOptions,
+    environment: &Environment,
+) -> Result<()> {
+    ensure_git_directory_layout(git_dir, bare, ref_storage, skip_hooks_and_info)?;
+
+    if let Some(tmpl) = template_dir {
+        if tmpl.is_dir() {
+            copy_template(tmpl, git_dir)?;
+        }
+    }
+
+    let needs_extensions = ref_storage.is_reftable() || object_format != HashAlgo::Sha1;
+    let repo_version = if needs_extensions { 1 } else { 0 };
+
+    let mut config_content = String::from("[core]\n");
+    config_content.push_str(&format!("\trepositoryformatversion = {repo_version}\n"));
+    config_content.push_str("\tfilemode = true\n");
+    if bare {
+        config_content.push_str("\tbare = true\n");
+    } else {
+        config_content.push_str("\tbare = false\n");
+        config_content.push_str("\tlogallrefupdates = true\n");
+    }
+    if needs_extensions {
+        config_content.push_str("[extensions]\n");
+        if ref_storage.is_reftable() {
+            config_content.push_str("\trefStorage = reftable\n");
+        }
+        if object_format != HashAlgo::Sha1 {
+            config_content.push_str(&format!("\tobjectformat = {}\n", object_format.name()));
+        }
+    }
+    fs::write(git_dir.join("config"), config_content)?;
+
+    // Merge `config` from the template on top of the default (matches `git clone --template`).
+    if let Some(tmpl) = template_dir {
+        if tmpl.is_dir() {
+            let tmpl_config = tmpl.join("config");
+            if tmpl_config.is_file() {
+                let tmpl_text = fs::read_to_string(&tmpl_config)?;
+                let tmpl_parsed = ConfigFile::parse(&tmpl_config, &tmpl_text, ConfigScope::Local)?;
+                let dest_path = git_dir.join("config");
+                let dest_text = fs::read_to_string(&dest_path)?;
+                let mut dest_parsed =
+                    ConfigFile::parse(&dest_path, &dest_text, ConfigScope::Local)?;
+                for e in &tmpl_parsed.entries {
+                    // Git clone ignores `core.bare` from templates (non-bare clone must stay non-bare).
+                    if e.key == "core.bare" {
+                        continue;
+                    }
+                    if let Some(v) = &e.value {
+                        let _ = dest_parsed.set(&e.key, v);
+                    } else {
+                        let _ = dest_parsed.set(&e.key, "true");
+                    }
+                }
+                dest_parsed.write()?;
+            }
+        }
+    }
+
+    crate::refs::store::initialize_head(
+        git_dir,
+        crate::refs::store::RawRef::Symbolic(format!("refs/heads/{initial_branch}")),
+    )?;
+
+    apply_init_filesystem_config(git_dir, init_filesystem, environment)?;
+
+    fs::write(
+        git_dir.join("description"),
+        "Unnamed repository; edit this file 'description' to name the repository.\n",
+    )?;
+    Ok(())
+}
+
+/// Initialise a non-bare repository with the git directory at `git_dir` and the work tree at `work_tree`.
+///
+/// Creates `work_tree/.git` as a gitfile pointing at `git_dir` (absolute path). Matches `git clone
+/// --separate-git-dir` layout.
+///
+/// # Errors
+///
+/// Returns [`Error::WorktreePathIo`] or [`RepositoryError::git_dir_path_io`] on filesystem failures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_repository_separate_git_dir(
+    work_tree: &Path,
+    git_dir: &Path,
+    initial_branch: &str,
+    template_dir: Option<&Path>,
+    ref_storage: crate::ref_storage::RefStorageFormat,
+    object_format: HashAlgo,
+    init_filesystem: InitFilesystemConfigOptions,
+    environment: &Environment,
+) -> Result<Repository> {
+    let skip_hooks_info = template_dir.is_some_and(|p| p.as_os_str().is_empty());
+    fs::create_dir_all(work_tree).map_err(|source| {
+        map_worktree_io(
+            path_for_error_message(work_tree),
+            WorktreePathOperation::Create,
+            source,
+        )
+    })?;
+    fs::create_dir_all(git_dir).map_err(|source| {
+        map_git_dir_io(git_dir, git_dir, GitDirPathOperation::CreateDir, source)
+    })?;
+    let existing = git_dir.join("config").is_file() && git_dir.join("HEAD").is_file();
+    if existing {
+        ensure_git_directory_layout(git_dir, false, ref_storage, skip_hooks_info)?;
+    } else {
+        write_fresh_git_directory(
+            git_dir,
+            false,
+            initial_branch,
+            template_dir,
+            ref_storage,
+            object_format,
+            skip_hooks_info,
+            init_filesystem,
+            environment,
+        )?;
+    }
+
+    // Write an absolute `gitdir:` path, matching C Git's `init_db` →
+    // `set_git_dir(real_git_dir, make_realpath=1)` → `separate_git_dir`, which records the
+    // realpath of the separate git directory (`t5601` "clone separate gitdir: output"). This
+    // path is only used by `git clone --separate-git-dir`; submodule layouts use a different
+    // code path and are unaffected.
+    let gitfile = work_tree.join(".git");
+    let abs_git_dir = crate::git_path::absolute_path_for_gitfile_stored_path(git_dir);
+    fs::write(gitfile, format!("gitdir: {abs_git_dir}\n"))?;
+
+    Repository::open(
+        git_dir,
+        &RepositoryOptions::with_environment(environment.clone()).with_work_tree(work_tree),
+    )
+}
+
+/// Initialise a **minimal** bare repository directory layout matching `git clone --template= --bare`.
+///
+/// Git's clone-with-empty-template omits `hooks/`, `info/`, `description`, and `branches/` until
+/// something needs them; tests rely on `mkdir <repo>/info` succeeding afterward.
+///
+/// # Parameters
+///
+/// - `git_dir` — bare repository root (the destination `.git` directory for a bare clone).
+/// - `initial_branch` — used only for the initial `HEAD` symref text before clone rewires it.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] on filesystem failures.
+/// Ensure `core.bare = true` in the repository `config` (used after `git clone --bare`).
+pub fn ensure_core_bare(git_directory: &Path) -> Result<()> {
+    let path = git_directory.join("config");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    if text.lines().any(|l| {
+        let t = l.trim();
+        t == "bare = true" || t == "bare=true"
+    }) {
+        return Ok(());
+    }
+    let mut out = text;
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    if !out.contains("[core]") {
+        out.push_str("[core]\n");
+    }
+    out.push_str("\tbare = true\n");
+    fs::write(path, out).map_err(Error::Io)
+}
+
+pub(crate) fn init_repository(
+    path: &Path,
+    bare: bool,
+    initial_branch: &str,
+    template_dir: Option<&Path>,
+    ref_storage: crate::ref_storage::RefStorageFormat,
+) -> Result<Repository> {
+    init_repository_with_object_format(
+        path,
+        bare,
+        initial_branch,
+        template_dir,
+        ref_storage,
+        HashAlgo::Sha1,
+        InitFilesystemConfigOptions::default(),
+        &Environment::empty(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_repository_with_object_format(
+    path: &Path,
+    bare: bool,
+    initial_branch: &str,
+    template_dir: Option<&Path>,
+    ref_storage: crate::ref_storage::RefStorageFormat,
+    object_format: HashAlgo,
+    init_filesystem: InitFilesystemConfigOptions,
+    environment: &Environment,
+) -> Result<Repository> {
+    let skip_hooks_info = !bare && template_dir.is_some_and(|p| p.as_os_str().is_empty());
+    let git_dir = if bare {
+        path.to_path_buf()
+    } else {
+        path.join(".git")
+    };
+
+    if !bare {
+        fs::create_dir_all(path).map_err(|source| {
+            map_worktree_io(
+                path_for_error_message(path),
+                WorktreePathOperation::Create,
+                source,
+            )
+        })?;
+    }
+    fs::create_dir_all(&git_dir).map_err(|source| {
+        if bare {
+            map_worktree_io(
+                path_for_error_message(path),
+                WorktreePathOperation::Create,
+                source,
+            )
+        } else {
+            map_git_dir_io(&git_dir, &git_dir, GitDirPathOperation::CreateDir, source)
+        }
+    })?;
+    let existing = git_dir.join("config").is_file() && git_dir.join("HEAD").is_file();
+    if existing {
+        ensure_git_directory_layout(&git_dir, bare, ref_storage, skip_hooks_info)?;
+    } else {
+        write_fresh_git_directory(
+            &git_dir,
+            bare,
+            initial_branch,
+            template_dir,
+            ref_storage,
+            object_format,
+            skip_hooks_info,
+            init_filesystem,
+            environment,
+        )?;
+    }
+
+    if bare {
+        Repository::open(
+            &git_dir,
+            &RepositoryOptions::with_environment(environment.clone()),
+        )
+    } else {
+        Repository::open(
+            &git_dir,
+            &RepositoryOptions::with_environment(environment.clone())
+                .with_work_tree(path.to_path_buf()),
+        )
+    }
+}
+
+/// Initialise a **bare** repository at `git_dir` with `core.worktree` set to `work_tree`.
+///
+/// Used when `GIT_WORK_TREE` is set during `git clone`: the clone destination is the bare
+/// git directory and checked-out files go under the environment work tree (matches upstream Git).
+///
+/// # Errors
+///
+/// Returns [`Error::WorktreePathIo`] or [`RepositoryError::git_dir_path_io`] on filesystem failures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_bare_with_env_worktree(
+    git_dir: &Path,
+    work_tree: &Path,
+    initial_branch: &str,
+    template_dir: Option<&Path>,
+    ref_storage: crate::ref_storage::RefStorageFormat,
+    object_format: HashAlgo,
+    init_filesystem: InitFilesystemConfigOptions,
+    environment: &Environment,
+) -> Result<Repository> {
+    fs::create_dir_all(git_dir)?;
+    fs::create_dir_all(work_tree)?;
+    let existing = git_dir.join("config").is_file() && git_dir.join("HEAD").is_file();
+    if existing {
+        ensure_git_directory_layout(git_dir, true, ref_storage, false)?;
+    } else {
+        write_fresh_git_directory(
+            git_dir,
+            true,
+            initial_branch,
+            template_dir,
+            ref_storage,
+            object_format,
+            false,
+            init_filesystem,
+            environment,
+        )?;
+    }
+    let work_tree_abs = work_tree
+        .canonicalize_simplified()
+        .unwrap_or_else(|_| work_tree.to_path_buf());
+    let config_path = git_dir.join("config");
+    let mut config = match ConfigFile::from_path(&config_path, ConfigScope::Local)? {
+        Some(c) => c,
+        None => ConfigFile::parse(&config_path, "", ConfigScope::Local)?,
+    };
+    config.set("core.worktree", &work_tree_abs.to_string_lossy())?;
+    config.write()?;
+    Repository::open(
+        git_dir,
+        &RepositoryOptions::with_environment(environment.clone()).with_work_tree(work_tree),
+    )
+}
+
+/// Recursively copy template files from `src` to `dst`.
+fn copy_template(src: &Path, dst: &Path) -> Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            fs::create_dir_all(&dst_path)?;
+            copy_template(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse `GIT_CEILING_DIRECTORIES` into a list of absolute paths and whether
+/// symlink resolution should be skipped.
+///
+/// The variable is colon-separated (`:`) on Unix.  Empty entries and
+/// non-absolute paths are silently skipped, matching Git's behaviour.
+///
+/// A leading colon (`:path1:path2`) disables symlink resolution for all
+/// ceiling paths AND the cwd used for comparison (Git `resolve_symlinks` flag).
+fn parse_ceiling_directories(env: &Environment) -> (Vec<PathBuf>, bool) {
+    let Some(raw) = env.git_ceiling_directories.as_deref() else {
+        return (Vec::new(), false);
+    };
+    if raw.is_empty() {
+        return (Vec::new(), false);
+    }
+    // A leading colon means "don't resolve symlinks".
+    let (no_resolve, effective) = match raw.strip_prefix(':') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let paths = effective
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let p = PathBuf::from(s);
+            if !p.is_absolute() {
+                return None;
+            }
+            if no_resolve {
+                // Strip trailing slashes for consistent comparison but don't resolve symlinks.
+                let s = s.trim_end_matches('/');
+                Some(PathBuf::from(s))
+            } else {
+                // Canonicalize to resolve symlinks; fall back to the raw path
+                // (with trailing slashes stripped) when the directory doesn't exist.
+                Some(p.canonicalize_simplified().unwrap_or_else(|_| {
+                    let s = s.trim_end_matches('/');
+                    PathBuf::from(s)
+                }))
+            }
+        })
+        .collect();
+    (paths, no_resolve)
+}
+
+/// Validate the repository format version from config text.
+///
+/// Returns [`ConfigError::UnsupportedRepositoryFormatVersion`] when the
+/// configured version is not supported.
+pub fn validate_repo_config(config_text: &str) -> std::result::Result<(), ConfigError> {
+    let mut version: u32 = 0;
+    let mut in_core = false;
+    for line in config_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_core = trimmed.to_lowercase().starts_with("[core");
+            continue;
+        }
+        if in_core {
+            if let Some(rest) = trimmed.strip_prefix("repositoryformatversion") {
+                let val = rest.trim_start_matches([' ', '=']).trim();
+                if let Ok(v) = val.parse::<u32>() {
+                    version = v;
+                }
+            }
+        }
+    }
+    if version >= 2 {
+        return Err(ConfigError::UnsupportedRepositoryFormatVersion { version });
+    }
+    Ok(())
+}
+
+/// Per-repository caches shared across open handles.
+pub mod caches {
+    pub use crate::repo_caches::*;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "repo/inject.rs"]
+pub(crate) mod inject;
+
+pub(crate) fn test_inject_rewrite_apply_abort_after_refs() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        inject::rewrite_apply_abort_after_refs()
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        false
+    }
+}
+
+fn test_inject_index_write_fail() -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        inject::index_write_fail()
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        Ok(())
+    }
+}
+
+#[path = "repo/repository_error.rs"]
+pub mod error;
+pub use error::{
+    RepositoryError, RepositoryResult, UnknownRepositoryExtensions, V1OnlyExtensionsInFormatZero,
+};
+
+#[path = "repo_location.rs"]
+mod location;
+pub use location::RepositoryLocation;
+
+#[cfg(test)]
+#[path = "repo_line_coverage_tests.rs"]
+mod line_coverage_tests;
+
+#[cfg(test)]
+mod config_session_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::ffi::OsString;
+
+    fn options_with_global(home: &Path, global: &Path) -> RepositoryOptions {
+        RepositoryOptions {
+            environment: Environment::from_vars(
+                [
+                    ("HOME", home.as_os_str()),
+                    ("GIT_CONFIG_NOSYSTEM", "1".as_ref()),
+                    ("GIT_CONFIG_GLOBAL", global.as_os_str()),
+                ]
+                .map(|(k, v)| (OsString::from(k), v.to_owned())),
+                home.to_path_buf(),
+            ),
+            ..RepositoryOptions::default()
+        }
+    }
+
+    #[test]
+    fn config_is_reused_until_a_cascade_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.cfg");
+        fs::write(&global, "[user]\n\tname = First\n").unwrap();
+        let work = dir.path().join("work");
+        let options = options_with_global(dir.path(), &global);
+        Repository::init(
+            &work,
+            &InitOptions {
+                environment: Some(options.environment.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let repo = Repository::discover(Some(&work), &options).unwrap();
+
+        let first = repo.config().snapshot().unwrap();
+        assert_eq!(first.value("user.name").as_deref(), Some("First"));
+        assert!(Arc::ptr_eq(&first, &repo.config().snapshot().unwrap()));
+
+        fs::write(&global, "[user]\n\tname = Second one\n").unwrap();
+        assert_eq!(
+            repo.config()
+                .snapshot()
+                .unwrap()
+                .value("user.name")
+                .as_deref(),
+            Some("Second one")
+        );
+
+        let local = repo.git_dir().join("config");
+        let mut text = fs::read_to_string(&local).unwrap();
+        text.push_str("[user]\n\tname = Local\n");
+        fs::write(&local, text).unwrap();
+        let reloaded = repo.config().snapshot().unwrap();
+        assert_eq!(reloaded.value("user.name").as_deref(), Some("Local"));
+        assert!(Arc::ptr_eq(&reloaded, &repo.config().snapshot().unwrap()));
+
+        fs::remove_file(&global).unwrap();
+        fs::write(&local, "[core]\n\trepositoryformatversion = 0\n").unwrap();
+        assert_eq!(repo.config().snapshot().unwrap().value("user.name"), None);
+    }
+
+    #[test]
+    fn a_replaced_environment_is_checked_in_full_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.cfg");
+        fs::write(&global, "[user]\n\tname = Env\n").unwrap();
+        let work = dir.path().join("work");
+        let options = options_with_global(dir.path(), &global);
+        Repository::init(
+            &work,
+            &InitOptions {
+                environment: Some(options.environment.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let mut repo = Repository::discover(Some(&work), &options).unwrap();
+        let before = repo.config().snapshot().unwrap();
+
+        // An equal snapshot in a new allocation passes the full check and keeps the session.
+        repo.environment = Arc::new(options.environment.clone());
+        assert!(Arc::ptr_eq(&before, &repo.config().snapshot().unwrap()));
+
+        // A snapshot naming another global file must not reuse the old stamps.
+        let other = dir.path().join("other.cfg");
+        fs::write(&other, "[user]\n\tname = Other\n").unwrap();
+        repo.environment = Arc::new(options_with_global(dir.path(), &other).environment);
+        assert_eq!(
+            repo.config()
+                .snapshot()
+                .unwrap()
+                .value("user.name")
+                .as_deref(),
+            Some("Other")
+        );
+    }
+}
+
+#[cfg(test)]
+mod ownership_safe_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn verify_safe_for_clone_source_errors_when_git_dir_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+        fs::remove_dir_all(repo.git_dir()).unwrap();
+        let err = repo.verify_safe_for_clone_source().unwrap_err();
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+    }
+}

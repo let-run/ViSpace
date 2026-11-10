@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ViSpace</title>
+<link rel="icon" type="image/png" href="./app-icon.png">
+<style>
+html,body{margin:0;height:100%;background:#121216;color:#e0dfe5;font:13px system-ui,sans-serif}
+#app{display:block;width:100%;height:100%;outline:none;touch-action:none}
+button{background:#383044;color:#f4d95c;border:1px solid #514667;border-radius:5px;padding:5px 10px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+#loading{position:absolute;top:45%;width:100%;text-align:center;white-space:pre-wrap;color:#c5bed6}
+</style>
+</head>
+<body>
+<div id="loading">Loading inventory…</div>
+<canvas id="app" tabindex="0"></canvas>
+<script type="module">
+const canvas = document.querySelector('#app');
+const loading = document.querySelector('#loading');
+function showError(error, stage) {
+  loading.textContent = 'Could not ' + stage + '.\n' + String(error);
+  if (!loading.isConnected) document.body.append(loading);
+}
+
+let stage = 'load application files';
+const slowStartup = setTimeout(() => {
+  loading.textContent = 'Still trying to ' + stage + '…\nIf this persists, close any other ViSpace tabs and reload.';
+}, 15000);
+
+try {
+  loading.textContent = 'Loading application files…';
+  const [
+    { default: init, start, runtime_error, supplier_request, browser_sync_snapshot },
+    { installSupplierBridge, installInventorySyncObserver },
+    { installSyncUI },
+  ] = await Promise.all([
+    import('./pkg/vispace.js'),
+    import('./host.js'),
+    import('./sync-ui.js'),
+  ]);
+  stage = 'initialize WebAssembly';
+  loading.textContent = 'Initializing WebAssembly…';
+  await init();
+  stage = 'open inventory and start the interface';
+  loading.textContent = 'Opening browser inventory…';
+  await start(canvas);
+  stage = 'finish startup';
+  installSupplierBridge(supplier_request);
+  installInventorySyncObserver(browser_sync_snapshot);
+  installSyncUI();
+  loading.remove();
+  canvas.focus();
+  const timer = setInterval(() => {
+    const error = runtime_error();
+    if (error) {
+      clearInterval(timer);
+      showError(error, "run the app");
+    }
+  }, 1000);
+} catch (error) {
+  showError(error, stage);
+  console.error(error);
+} finally {
+  clearTimeout(slowStartup);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+name: Build ViSpace Chrome extension
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test Chrome extension
+        run: node --test chrome-extension/tests/*.cjs
+
+      - name: Package Chrome extension
+        working-directory: chrome-extension
+        run: |
+          version=$(node -p 'require("./manifest.json").version')
+          mkdir -p ../release-output
+          zip "../release-output/ViSpace-Chrome-${version}.zip" manifest.json *.html *.css *.js icons/*.png
+
+      - name: Upload Chrome extension ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ViSpace-Chrome-extension
+          path: release-output/ViSpace-Chrome-*.zip
+          if-no-files-found: error
+          compression-level: 0

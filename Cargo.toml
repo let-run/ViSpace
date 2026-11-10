@@ -1,0 +1,120 @@
+[package]
+name = "vispace"
+version = "0.1.0"
+edition = "2024"
+default-run = "vispace"
+rust-version = "1.95"
+license = "MIT"
+description = "ViSpace electronics inventory and KiCad workspace"
+
+[dependencies]
+inventory-kicad = { path = "crates/kicad-reader" }
+inventory-kicad-models = { path = "crates/kicad-models" }
+inventory-kicad-renderer = { path = "crates/kicad-renderer" }
+inventory-niimbot = { path = "crates/niimbot" }
+inventory-barcode-camera = { path = "crates/barcode-camera" }
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
+csv = "1"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui-wgpu = "0.33"
+egui = { version = "0.33", default-features = false, features = ["serde"] }
+egui_extras = { version = "0.33", features = ["all_loaders"] }
+base64 = "0.22"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ab_glyph = "0.2"
+epaint_default_fonts = "0.33"
+qrcode = { version = "0.14", default-features = false }
+png = "0.18"
+flate2 = "1"
+sha1 = "0.11"
+sha2 = "0.11"
+latex-rust = "2.1.1"
+pulldown-cmark = { version = "0.13.3", default-features = false }
+resvg = { version = "0.45.1", default-features = false }
+regex = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+lyon_tessellation = "1"
+web-time = "1"
+chrono = "0.4"
+bincode = { version = "2.0.1", default-features = false, features = ["std", "serde"] }
+
+
+
+
+[dev-dependencies]
+rqrr = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+grit-lib = { package = "grit-lib-wasm", path = "crates/grit-lib-wasm", features = ["http-ureq"] }
+arboard = "3.7"
+directories = "6"
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rfd = "0.15"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+tempfile = "3"
+rayon = "1.12"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "fs", "macros"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-platform-verifier = "0.7"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"
+crc32fast = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+mdns-sd = "0.21.7"
+
+[workspace]
+members = ["crates/barcode-camera", "crates/niimbot", "crates/kicad-reader", "crates/kicad-models", "crates/kicad-renderer"]
+exclude = ["crates/grit-lib-wasm"]
+resolver = "3"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+grit-lib = { package = "grit-lib-wasm", path = "crates/grit-lib-wasm", default-features = false }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "Storage", "Navigator", "Clipboard", "Event", "EventTarget", "HtmlInputElement", "File", "FileList", "Worker", "WorkerOptions", "WorkerType", "MessageEvent", "DedicatedWorkerGlobalScope"] }
+uuid = { version = "1", features = ["v4", "serde", "js"] }
+futures-channel = "0.3"
+futures-util = "0.3"
+egui-wgpu = { version = "0.33", features = ["fragile-send-sync-non-atomic-wasm"] }
+wgpu = { version = "27", features = ["webgl"] }
+
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# Git/model payload processing remains fast in the locally packaged debug app.
+[profile.dev.package.grit-lib-wasm]
+opt-level = 2
+[profile.dev.package.zlib-rs]
+opt-level = 2
+[profile.dev.package.sha1]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 2
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+metal = "0.32"
+objc2 = "0.6"
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGColorSpace"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSGeometry", "objc2-core-foundation"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }

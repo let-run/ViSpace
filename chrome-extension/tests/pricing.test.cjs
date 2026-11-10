@@ -1,0 +1,18 @@
+const assert = require('assert').strict;
+const fs = require('fs');
+const vm = require('vm');
+const context = vm.createContext({});
+vm.runInContext(fs.readFileSync(require('path').join(__dirname, '../pricing.js'), 'utf8'), context);
+const price = context.priceForQuantity;
+const tiers = '1+ US$ 0.50 US$ 0.50; 10+ US$ 0.40 US$ 4.00; 100+ US$ 0.30 US$ 30.00';
+assert.equal(price(tiers, 1), 'US$ 0.50 / unit');
+assert.equal(price(tiers, 10), 'US$ 0.40 / unit');
+assert.equal(price(tiers, 99), 'US$ 0.40 / unit');
+assert.equal(price(tiers, 100), 'US$ 0.30 / unit');
+assert.equal(price('1-9 USD 0.50; 20-99 USD 0.30', 15), 'USD 0.50 / unit');
+assert.equal(price('100+ USD 0.30', 1, 'USD 0.60 / unit'), 'USD 0.60 / unit');
+assert.equal(price('1,000+ $0.20; 1+ $0.50', 1000), '$0.20 / unit');
+assert.equal(price('unparsed; tiers', 20, 'USD 1 / unit'), 'USD 1 / unit');
+assert.equal(price('USD 0.25 / unit', 500), 'USD 0.25 / unit');
+assert.equal(price('100+ USD 0.30', 1), '');
+console.log('PASS: quantity boundaries, ranges, gaps, fallback, and scalar prices');

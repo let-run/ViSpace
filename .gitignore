@@ -1,0 +1,16 @@
+.build/
+dist/
+demo
+.DS_Store
+.vspace.cache
+.idea
+
+# Local development TLS certificates and private keys
+rust/.local-tls/
+/.local-tls/
+/target/
+/data/
+/.tools/
+/crates/*/target/
+*.sqlite*
+__pycache__/

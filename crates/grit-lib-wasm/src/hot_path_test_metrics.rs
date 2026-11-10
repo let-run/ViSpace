@@ -1,0 +1,432 @@
+#![allow(missing_docs)]
+//! Per-[`crate::odb::Odb`] hot-path counters for regression tests (test builds only).
+
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
+
+/// Counters and opt-in recording flags for one object database / repository.
+#[derive(Default)]
+pub struct HotPathTestMetrics {
+    tree_writes: AtomicUsize,
+    sparse_expanded_rows: AtomicUsize,
+    cache_tree_builds: AtomicUsize,
+    freshen_calls: AtomicUsize,
+    blob_content_reads: AtomicUsize,
+    stream_hash_calls: AtomicUsize,
+    staging_passes: AtomicUsize,
+    stream_write_calls: AtomicUsize,
+    blob_read_threads: Mutex<HashSet<ThreadId>>,
+    pack_signature_stats: AtomicUsize,
+    midx_stamp_stats: AtomicUsize,
+    pack_dir_stats: AtomicUsize,
+    loose_path_open_attempts: AtomicUsize,
+    loose_objects_root_metadata: AtomicUsize,
+    loose_fanout_metadata: AtomicUsize,
+    loose_path_exists_probes: AtomicUsize,
+    pack_dir_metadata: AtomicUsize,
+    commit_parse_calls: AtomicUsize,
+    freshen_counting: AtomicBool,
+    blob_counting: AtomicBool,
+    stamp_counting: AtomicBool,
+    loose_open_counting: AtomicBool,
+    loose_metadata_counting: AtomicBool,
+    commit_parse_counting: AtomicBool,
+}
+
+impl HotPathTestMetrics {
+    /// Allocate a fresh counter bundle for one [`crate::odb::Odb`].
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn sparse_expanded_rows(&self) -> usize {
+        self.sparse_expanded_rows.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_sparse_expanded_rows(&self, count: usize) {
+        self.sparse_expanded_rows
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Clear tree-write count.
+    pub fn reset_tree_writes(&self) {
+        self.tree_writes.store(0, Ordering::SeqCst);
+    }
+
+    /// Tree objects written through this ODB since the last reset.
+    #[must_use]
+    pub fn tree_writes(&self) -> usize {
+        self.tree_writes.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_tree_write(&self) {
+        self.tree_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whole-tree cache-tree builds (`build_cache_tree_from_tree`) on this ODB.
+    #[must_use]
+    pub fn cache_tree_builds(&self) -> usize {
+        self.cache_tree_builds.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_cache_tree_build(&self) {
+        self.cache_tree_builds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clear freshen-touch count.
+    pub fn reset_freshen_calls(&self) {
+        self.freshen_calls.store(0, Ordering::SeqCst);
+    }
+
+    pub fn set_freshen_counting(&self, enabled: bool) {
+        self.freshen_counting.store(enabled, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn freshen_calls(&self) -> usize {
+        self.freshen_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_freshen(&self) {
+        if self.freshen_counting.load(Ordering::Relaxed) {
+            self.freshen_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_stream_write(&self) {
+        self.stream_write_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn stream_write_calls(&self) -> usize {
+        self.stream_write_calls.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_staging_pass(&self) {
+        self.staging_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn staging_passes(&self) -> usize {
+        self.staging_passes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_stream_hash(&self) {
+        self.stream_hash_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn stream_hash_calls(&self) -> usize {
+        self.stream_hash_calls.load(Ordering::Relaxed)
+    }
+
+    /// Clear worktree blob read count.
+    pub fn reset_blob_content_reads(&self) {
+        self.blob_content_reads.store(0, Ordering::SeqCst);
+        self.blob_read_threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    pub fn set_blob_counting(&self, enabled: bool) {
+        self.blob_counting.store(enabled, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn blob_content_reads(&self) -> usize {
+        self.blob_content_reads.load(Ordering::SeqCst)
+    }
+
+    /// Distinct threads that read worktree blob content since the last reset.
+    #[must_use]
+    pub fn blob_read_thread_count(&self) -> usize {
+        self.blob_read_threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    pub(crate) fn record_blob_content_read(&self) {
+        if self.blob_counting.load(Ordering::Relaxed) {
+            self.blob_content_reads.fetch_add(1, Ordering::Relaxed);
+            self.blob_read_threads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(std::thread::current().id());
+        }
+    }
+
+    pub fn reset_pack_stamp_stats(&self) {
+        self.pack_signature_stats.store(0, Ordering::SeqCst);
+    }
+
+    pub fn reset_midx_stamp_stats(&self) {
+        self.midx_stamp_stats.store(0, Ordering::SeqCst);
+    }
+
+    pub fn reset_pack_dir_stats(&self) {
+        self.pack_dir_stats.store(0, Ordering::SeqCst);
+    }
+
+    /// Clear loose-object `open` attempt count.
+    pub fn reset_loose_path_open_attempts(&self) {
+        self.loose_path_open_attempts.store(0, Ordering::SeqCst);
+    }
+
+    pub fn set_loose_open_counting(&self, enabled: bool) {
+        self.loose_open_counting.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_loose_metadata_counting(&self, enabled: bool) {
+        self.loose_metadata_counting
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn reset_loose_metadata_probes(&self) {
+        self.loose_objects_root_metadata.store(0, Ordering::SeqCst);
+        self.loose_fanout_metadata.store(0, Ordering::SeqCst);
+        self.loose_path_exists_probes.store(0, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn loose_objects_root_metadata_probes(&self) -> usize {
+        self.loose_objects_root_metadata.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn loose_fanout_metadata_probes(&self) -> usize {
+        self.loose_fanout_metadata.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn loose_path_exists_probes(&self) -> usize {
+        self.loose_path_exists_probes.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn loose_metadata_probe_total(&self) -> usize {
+        self.loose_objects_root_metadata_probes()
+            + self.loose_fanout_metadata_probes()
+            + self.loose_path_exists_probes()
+    }
+
+    pub fn reset_pack_dir_metadata_probes(&self) {
+        self.pack_dir_metadata.store(0, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn pack_dir_metadata_probes(&self) -> usize {
+        self.pack_dir_metadata.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_loose_objects_root_metadata(&self) {
+        if self.loose_metadata_counting.load(Ordering::Relaxed) {
+            self.loose_objects_root_metadata
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_loose_fanout_metadata(&self) {
+        if self.loose_metadata_counting.load(Ordering::Relaxed) {
+            self.loose_fanout_metadata.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_loose_path_exists_probe(&self) {
+        if self.loose_metadata_counting.load(Ordering::Relaxed) {
+            self.loose_path_exists_probes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_pack_dir_metadata(&self) {
+        if self.stamp_counting.load(Ordering::Relaxed) {
+            self.pack_dir_metadata.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn reset_commit_parse_calls(&self) {
+        self.commit_parse_calls.store(0, Ordering::SeqCst);
+    }
+
+    pub fn set_commit_parse_counting(&self, enabled: bool) {
+        self.commit_parse_counting.store(enabled, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn commit_parse_calls(&self) -> usize {
+        self.commit_parse_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_commit_parse(&self) {
+        if self.commit_parse_counting.load(Ordering::Relaxed) {
+            self.commit_parse_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub fn loose_path_open_attempts(&self) -> usize {
+        self.loose_path_open_attempts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_loose_path_open(&self) {
+        if self.loose_open_counting.load(Ordering::Relaxed) {
+            self.loose_path_open_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_stamp_counting(&self, enabled: bool) {
+        self.stamp_counting.store(enabled, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn pack_signature_stat_calls(&self) -> usize {
+        self.pack_signature_stats.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn midx_stamp_stat_calls(&self) -> usize {
+        self.midx_stamp_stats.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_pack_signature_stat(&self) {
+        if self.stamp_counting.load(Ordering::Relaxed) {
+            self.pack_signature_stats.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `stat` calls on a `pack/` directory to check whether its listing changed.
+    #[must_use]
+    pub fn pack_dir_stat_calls(&self) -> usize {
+        self.pack_dir_stats.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_pack_dir_stat(&self) {
+        if self.stamp_counting.load(Ordering::Relaxed) {
+            self.pack_dir_stats.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub(crate) fn record_midx_stamp_stat(&self) {
+        if self.stamp_counting.load(Ordering::Relaxed) {
+            self.midx_stamp_stats.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Disable all opt-in recording (safe to call from [`HotPathMetricsScope`] drop).
+    pub fn disable_all_counting(&self) {
+        self.set_freshen_counting(false);
+        self.set_blob_counting(false);
+        self.set_stamp_counting(false);
+        self.set_loose_open_counting(false);
+        self.set_loose_metadata_counting(false);
+        self.set_commit_parse_counting(false);
+    }
+}
+
+// hygiene: test-only thread-local scope for hot-path stat attribution in unit tests
+thread_local! {
+    static ACTIVE: RefCell<Option<Arc<HotPathTestMetrics>>> = const { RefCell::new(None) };
+}
+
+fn with_active<F, R>(f: F) -> R
+where
+    F: FnOnce(Option<Arc<HotPathTestMetrics>>) -> R,
+{
+    ACTIVE.with(|cell| f(cell.borrow().clone()))
+}
+
+pub(crate) fn record_pack_signature_stat_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_pack_signature_stat();
+        }
+    });
+}
+
+pub(crate) fn record_midx_stamp_stat_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_midx_stamp_stat();
+        }
+    });
+}
+
+pub(crate) fn record_pack_dir_stat_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_pack_dir_stat();
+        }
+    });
+}
+
+pub(crate) fn record_loose_path_open_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_loose_path_open();
+        }
+    });
+}
+
+pub(crate) fn record_loose_objects_root_metadata_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_loose_objects_root_metadata();
+        }
+    });
+}
+
+pub(crate) fn record_loose_fanout_metadata_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_loose_fanout_metadata();
+        }
+    });
+}
+
+pub(crate) fn record_loose_path_exists_probe_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_loose_path_exists_probe();
+        }
+    });
+}
+
+pub(crate) fn record_pack_dir_metadata_for_active_scope() {
+    with_active(|active| {
+        if let Some(m) = active {
+            m.record_pack_dir_metadata();
+        }
+    });
+}
+
+/// Installs `metrics` as the active scope for pack/MIDX stat attribution on this thread.
+pub struct HotPathMetricsScope {
+    prev: Option<Arc<HotPathTestMetrics>>,
+    installed: Option<Arc<HotPathTestMetrics>>,
+}
+
+impl HotPathMetricsScope {
+    /// Begin attributing pack/MIDX stat probes to `metrics` on this thread.
+    #[must_use]
+    pub fn install(metrics: Arc<HotPathTestMetrics>) -> Self {
+        let prev = ACTIVE.with(|cell| cell.borrow_mut().replace(Arc::clone(&metrics)));
+        Self {
+            prev,
+            installed: Some(metrics),
+        }
+    }
+}
+
+impl Drop for HotPathMetricsScope {
+    fn drop(&mut self) {
+        if let Some(m) = self.installed.take() {
+            m.disable_all_counting();
+        }
+        ACTIVE.with(|cell| {
+            *cell.borrow_mut() = self.prev.take();
+        });
+    }
+}

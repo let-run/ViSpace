@@ -1,0 +1,12 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {InventoryStorage} from './storage-client.js';
+import {requireWorkspacePermission} from './workspace-access.js';
+function fake(){const worker={messages:[],postMessage(message){this.messages.push(message);},reply(value,error){const request=this.messages.shift();this.onmessage({data:{id:request.id,value,error}});}};return worker;}
+test('SQL state changes only after the worker acknowledges the durable operation',async()=>{const worker=fake(),client=new InventoryStorage(worker);const opening=client.init('legacy',null);assert.equal(client.state,null);worker.reply({revision:1,snapshot:'before'});await opening;const saving=client.save('after');assert.equal(worker.messages[0].expected,1);assert.equal(client.state.snapshot,'before');worker.reply({revision:2,snapshot:'after'});await saving;assert.equal(client.state.snapshot,'after');});
+test('failed writes preserve the last committed client state',async()=>{const worker=fake(),client=new InventoryStorage(worker);client.state={revision:3,snapshot:'saved'};const save=client.save('unsaved');worker.reply(null,'Reconnect folder');await assert.rejects(save,/Reconnect folder/);assert.equal(client.state.snapshot,'saved');assert.equal(client.state.revision,3);});
+test('worker failures reject every outstanding operation',async()=>{const worker=fake(),client=new InventoryStorage(worker);const a=client.call('state'),b=client.backup();worker.onerror({message:'worker stopped'});await assert.rejects(a,/worker stopped/);await assert.rejects(b,/worker stopped/);assert.equal(client.pending.size,0);});
+test('uncloneable handles fail without leaking a pending request',async()=>{const worker={postMessage(){throw Error('not cloneable');}},client=new InventoryStorage(worker);await assert.rejects(client.call('bind',{folder:{}}),/not cloneable/);assert.equal(client.pending.size,0);});
+test('background workspace writes never request permissions',async()=>{for(const state of ['prompt','denied']){let prompts=0;await assert.rejects(requireWorkspacePermission({queryPermission:async()=>state,requestPermission(){prompts++;}}),/Reconnect folder/);assert.equal(prompts,0);}await requireWorkspacePermission(null);await requireWorkspacePermission({queryPermission:async()=> 'granted'});});
+
+test('unavailable directory permission becomes a reconnect state',async()=>{await assert.rejects(requireWorkspacePermission({queryPermission:async()=>{throw Error('Permission unavailable');}}),/Reconnect folder/);});

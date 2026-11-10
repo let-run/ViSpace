@@ -1,0 +1,37 @@
+<!doctype html><meta charset="utf-8"><title>Supplier bridge integration checks</title>
+<button id="run">Run isolated supplier import checks</button><pre id="result">Serve on a fresh disposable origin, not your inventory app's origin.</pre><canvas id="app" width="800" height="400"></canvas>
+<script type="module">
+import init,{start,supplier_request,export_inventory} from './pkg/vispace.js';
+import {installSupplierBridge} from './host.js';
+const out=document.querySelector('#result');
+const assert=(ok,message)=>{if(!ok)throw Error(message);out.textContent+='\nPASS '+message;};
+function request(operation,payload={}){
+ return new Promise((resolve,reject)=>{
+  const id=crypto.randomUUID();const timer=setTimeout(()=>{window.removeEventListener('message',receive);reject(Error('Bridge timeout'));},15000);
+  function receive(event){const msg=event.data;if(event.source!==window||msg?.id!==id||msg.direction!=='response')return;clearTimeout(timer);window.removeEventListener('message',receive);msg.error?reject(Error(msg.error)):resolve(msg.value);}
+  window.addEventListener('message',receive);window.postMessage({channel:'bom-inventory.supplier.v1',direction:'request',id,operation,payload:JSON.stringify(payload)},location.origin);
+ });
+}
+document.querySelector('#run').onclick=async()=>{
+ document.querySelector('#run').disabled=true;out.textContent='Running…';
+ try{
+  await init();await start(document.querySelector('#app'));installSupplierBridge(supplier_request);
+  assert((await request('health')).application==='bom-inventory','app bridge discovers a ready WASM app');
+  const before=JSON.parse(export_inventory()).purchases.length;
+  const image=document.createElement('canvas');image.width=2;image.height=2;
+  const payload={requestID:crypto.randomUUID(),part:{number:'BRIDGE-TEST',supplier:'LCSC',spn:'C123',customFields:{'LCSC Price':'USD 0.15'}},quantity:3,assignments:[{project:'Bridge Demo',quantity:2}],imageBase64:image.toDataURL('image/png').split(',')[1]};
+  const saved=await request('purchase',payload);assert(!!saved.id,'purchase response confirms a saved ID');
+  const db=await new Promise((resolve,reject)=>{const r=indexedDB.open('bom-inventory');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});
+  const stored=await new Promise((resolve,reject)=>{const r=db.transaction('inventory').objectStore('inventory').get('current');r.onsuccess=()=>resolve(JSON.parse(r.result));r.onerror=()=>reject(r.error);});db.close();
+  const purchase=stored.purchases.find(p=>p.part.id===saved.id);
+  assert(purchase?.part.stock===3&&purchase.assignments[0].quantity===2,'confirmation waits for durable IndexedDB save, including allocations');
+  assert(purchase.part.image.originalPath.startsWith('data:image/png;base64,'),'photo saved in browser inventory');
+  assert(purchase.part.customFields['LCSC Price']==='USD 0.15','supplier price retained');
+  assert((await request('projects')).some(p=>p.name==='Bridge Demo'),'project names returned for extension allocations');
+  assert((await request('purchase',payload)).id===saved.id&&JSON.parse(export_inventory()).purchases.length===before+1,'replayed request does not duplicate purchase');
+  await request('purchase',{requestID:crypto.randomUUID(),part:{number:'INVALID'},quantity:1,assignments:[{project:'Invalid',quantity:2}]}).then(()=>{throw Error('invalid request accepted');},()=>assert(true,'invalid allocation is rejected'));
+  assert(JSON.parse(export_inventory()).purchases.length===before+1,'invalid request leaves inventory unchanged');
+  out.textContent+='\nALL CHECKS PASSED';
+ }catch(error){out.textContent+='\nFAILED '+(error.stack||error);}
+};
+</script>

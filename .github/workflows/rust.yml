@@ -1,0 +1,19 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: [self-hosted, Linux, X64, vispace-release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install browser target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Check desktop targets
+        run: cargo check --locked --all-targets
+      - name: Check browser build
+        run: cargo check --locked --lib --target wasm32-unknown-unknown

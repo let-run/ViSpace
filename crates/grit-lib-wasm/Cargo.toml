@@ -1,0 +1,102 @@
+[package]
+name = "grit-lib-wasm"
+version = "0.5.29"
+edition = "2021"
+rust-version = "1.95"
+autotests = false
+license = "MIT"
+description = "Core library for the grit Git implementation"
+readme = "README.md"
+repository = "https://github.com/gitbutlerapp/grit"
+autobenches = false
+autoexamples = false
+
+# Match workspace clippy/rustdoc denies; allow `unsafe` for `git_date` (`libc` FFI like Git `date.c`).
+# `lints.workspace = true` is incompatible with relaxing `unsafe_code` on this crate alone.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+invalid_html_tags = "deny"
+invalid_codeblock_attributes = "deny"
+bare_urls = "deny"
+
+[features]
+# Tests that start the system `git` or build heavy fixtures run only with this
+# feature (`make test-full`, the nightly CI job); see TESTING.md.
+full-tests = ["test-support"]
+# Provides the default `ureq`-backed `HttpClient` for the smart-HTTP transport
+# (`transport::http::ureq_client`). Off by default so embedders can bring their
+# own HTTP stack.
+http-ureq = ["dep:ureq", "dep:base64", "ureq?/rustls"]
+# Use the platform TLS stack (Secure Transport on macOS) instead of rustls.
+http-ureq-native-tls = ["http-ureq", "ureq?/native-tls"]
+# Unstable test hooks for the workspace; outside semver — dev-dependencies and internal crates only.
+test-support = []
+# Forward `trace_span!` to the `tracing` crate (zero cost when disabled).
+tracing = ["dep:tracing"]
+# Derive or implement `serde::Serialize` on result models (`StatusModel`, `DiffEntry`,
+# `LoadedCommit`, commit/switch/reset/fetch/push/stash/rebase outcomes, blame/describe/tag/worktree
+# results, `Signature`, `Error`, …).
+serde-models = []
+# Lay out grit-lib's hot code path (hot-text.ld) contiguously in every binary that links the
+# library, so short operations fault in fewer code pages. x86_64 Linux GNU (LLD) only; a
+# no-op elsewhere. See build.rs.
+hot-text-layout = []
+
+[dependencies]
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha1 = "0.11"
+sha1dc = "=0.1.5"
+sha2 = "0.11"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+hex = "0.4"
+tempfile = "3"
+similar = { version = "3", features = ["inline"] }
+merge3 = "0.2"
+regex = "1"
+regex-automata = { version = "0.4.16", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid", "dfa-onepass", "perf-inline", "perf-literal", "unicode"] }
+libc = "0.2"
+encoding_rs = "0.8.35"
+icu_normalizer = "2.0.0"
+url = "2.5"
+filetime = "0.2"
+shell-words = "1.1"
+smallvec = "1.15"
+
+# Optional: the default `ureq`-backed HTTP client (feature `http-ureq`).
+ureq = { version = "3.5", default-features = false, optional = true, features = ["gzip"] }
+base64 = { version = "0.22", optional = true }
+crc32fast = "1.5.0"
+getrandom = "0.2"
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more"] }
+memmap2 = "0.9"
+memchr = "2.7"
+tzdb = "0.7.3"
+tz = { package = "tz-rs", version = "0.7.3" }
+
+# `nix` (uid lookup, uname) is only used behind `#[cfg(unix)]`, so it is not
+# pulled in on Windows.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["user", "feature"] }
+rustix = { version = "1.1", default-features = false, features = ["process"] }
+
+# `windows-sys` backs the Windows Credential Manager store (`credentials::windows_store`),
+# used by the built-in `gs manager` credential helper, and enabling ANSI virtual
+# terminal processing for colored output (`terminal`). Windows-only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

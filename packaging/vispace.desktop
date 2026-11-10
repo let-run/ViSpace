@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ViSpace
+Comment=Electronics inventory and KiCad workspace
+Exec=vispace
+Icon=vispace
+Terminal=false
+Categories=Development;Electronics;

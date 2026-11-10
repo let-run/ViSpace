@@ -1,0 +1,15 @@
+[package]
+name = "inventory-kicad-models"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Portable KiCad model resolution, STEP/VRML meshing and mesh caching"
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+truck-stepio = { version = "0.3", default-features = false, features = ["in", "derive"] }
+truck-meshalgo = { version = "0.4", default-features = false, features = ["tessellation"] }
+ruststep = "0.4"
+base64 = "0.22"
+ruzstd = "0.8"
+
+truck-topology = "0.6"

@@ -1,0 +1,11 @@
+[package]
+name = "inventory-kicad"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Standalone handwritten KiCad project and schematic readers with a portable drawing scene"
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

@@ -1,0 +1,642 @@
+//! Shared pathspec matching against index, HEAD tree, and worktree paths.
+
+use crate::diff::DiffEntry;
+use crate::error::{Error, Result};
+use crate::git_path::pathspec_traverses_symlink_dir;
+use crate::index::{Index, MODE_TREE};
+use crate::objects::{parse_tree, ObjectId};
+use crate::pathspec::{
+    has_glob_chars, pathspec_has_attr_magic, pathspec_is_exclude, sorted_paths_match_pathspec,
+    PathspecListMatcher, PathspecMatchContext, PathspecMatcher,
+};
+use crate::repo::Repository;
+use crate::state::resolve_head_for_repository;
+use crate::unicode_normalization::resolve_worktree_path_for_staging;
+use std::collections::HashSet;
+
+/// Returns whether `resolved` matches at least one path in the index (stage 0), `HEAD` tree,
+/// or an on-disk worktree file (literal pathspecs only).
+///
+/// # Errors
+///
+/// Propagates object-store failures while reading `HEAD`'s tree.
+pub fn pathspec_matches_known_in_repository(repo: &Repository, resolved: &str) -> Result<bool> {
+    KnownPathspecChecker::new(repo).matches(resolved)
+}
+
+/// Like [`pathspec_matches_known_in_repository`], but returns [`Error::PathspecNoMatch`] when
+/// nothing matches.
+pub fn ensure_pathspec_matches_known_in_repository(
+    repo: &Repository,
+    display_spec: &str,
+    resolved: &str,
+) -> Result<()> {
+    KnownPathspecChecker::new(repo).ensure(display_spec, resolved)
+}
+
+/// Checks pathspecs against the paths a repository knows about: stage-0 index entries, the
+/// `HEAD` tree, and (for literal pathspecs) files on disk.
+///
+/// The index and `HEAD` tree are read at most once per checker, and only when some pathspec is
+/// not already satisfied by an on-disk worktree file, so validating many literal paths costs one
+/// `stat` per path instead of one full index load and tree walk per path.
+pub(crate) struct KnownPathspecChecker<'r> {
+    repo: &'r Repository,
+    ignorecase: bool,
+    precompose: bool,
+    known: Option<Vec<String>>,
+}
+
+impl<'r> KnownPathspecChecker<'r> {
+    /// Creates a checker for `repo`; nothing is read until the first query.
+    pub fn new(repo: &'r Repository) -> Self {
+        Self {
+            repo,
+            ignorecase: repo_pathspec_ignorecase(repo),
+            precompose: repo.pathspec_precompose_enabled(),
+            known: None,
+        }
+    }
+
+    /// Returns whether `resolved` matches a known path (see
+    /// [`pathspec_matches_known_in_repository`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates failures loading the index or reading `HEAD`'s tree.
+    pub(crate) fn matches(&mut self, resolved: &str) -> Result<bool> {
+        if is_literal_worktree_pathspec(resolved)
+            && !self.traverses_symlink_dir(resolved)
+            && self.exists_in_worktree(resolved)
+        {
+            return Ok(true);
+        }
+        self.matches_known_paths(resolved)
+    }
+
+    /// Like [`Self::matches`], but maps a miss to [`Error::PathspecNoMatch`] and a literal path
+    /// through a symlinked directory to [`Error::PathspecBeyondSymlink`].
+    ///
+    /// # Errors
+    ///
+    /// The errors above, plus failures loading the index or reading `HEAD`'s tree.
+    pub(crate) fn ensure(&mut self, display_spec: &str, resolved: &str) -> Result<()> {
+        if self.traverses_symlink_dir(resolved) {
+            return Err(Error::PathspecBeyondSymlink {
+                spec: display_spec.to_owned(),
+            });
+        }
+        let matched = (is_literal_worktree_pathspec(resolved) && self.exists_in_worktree(resolved))
+            || self.matches_known_paths(resolved)?;
+        if matched {
+            Ok(())
+        } else {
+            Err(Error::PathspecNoMatch {
+                spec: display_spec.to_owned(),
+            })
+        }
+    }
+
+    fn matches_known_paths(&mut self, resolved: &str) -> Result<bool> {
+        if self.known.is_none() {
+            self.known = Some(known_paths(self.repo)?);
+        }
+        let known = self.known.as_deref().unwrap_or_default();
+        if pathspec_has_attr_magic(resolved) {
+            let specs = [resolved.to_owned()];
+            let matcher = self.repo.pathspec_matcher(&specs)?;
+            return Ok(known.iter().any(|path| matcher.matches(path)));
+        }
+        Ok(sorted_paths_match_pathspec(
+            resolved,
+            known,
+            self.repo.pathspec_match_context(),
+        ))
+    }
+
+    fn traverses_symlink_dir(&self, resolved: &str) -> bool {
+        self.repo.work_tree().is_some_and(|work_tree| {
+            pathspec_traverses_symlink_dir(work_tree, resolved, self.precompose, self.ignorecase)
+        })
+    }
+
+    fn exists_in_worktree(&self, resolved: &str) -> bool {
+        let Some(work_tree) = self.repo.work_tree() else {
+            return false;
+        };
+        if self.precompose {
+            resolve_worktree_path_for_staging(work_tree, resolved, true)
+                .abs
+                .exists()
+        } else {
+            work_tree.join(resolved).exists()
+        }
+    }
+}
+
+/// Pathspec list matching for porcelain commands: fast literal matching when no spec uses
+/// `:(attr:...)` magic, otherwise a repository [`PathspecMatcher`] with the attribute stack.
+pub(crate) enum RepositoryPathspecFilter<'a> {
+    List(PathspecListMatcher<'a>),
+    Attr(PathspecMatcher<'a>),
+}
+
+impl<'a> RepositoryPathspecFilter<'a> {
+    /// Builds a filter for `pathspecs`, loading gitattributes when any spec needs them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidAttrPathspec`] when an attribute pathspec is malformed.
+    pub(crate) fn try_new(repo: &Repository, pathspecs: &'a [String]) -> Result<Self> {
+        if pathspecs.iter().any(|s| pathspec_has_attr_magic(s)) {
+            Ok(Self::Attr(repo.pathspec_matcher(pathspecs)?))
+        } else {
+            Ok(Self::List(PathspecListMatcher::new(
+                pathspecs,
+                repo.pathspec_match_context(),
+            )))
+        }
+    }
+
+    /// Honors index/tree entry `mode` for directory, submodule, and `builtin_objectmode` specs.
+    #[must_use]
+    pub(crate) fn matches_entry(&self, path: &str, mode: u32) -> bool {
+        match self {
+            Self::List(m) => m.matches(path),
+            Self::Attr(m) => m.matches_entry(path, mode),
+        }
+    }
+}
+
+pub(crate) const REGULAR_FILE_MODE: u32 = 0o100644;
+
+/// Path and index/tree mode for attribute-aware pathspec matching.
+pub(crate) struct PathspecMatchEntry<'a> {
+    pub path: &'a str,
+    pub mode: u32,
+}
+
+/// Stage-0 index paths with their object modes (last stage 0 wins on duplicates).
+pub(crate) fn index_stage0_path_modes(index: &Index) -> std::collections::HashMap<String, u32> {
+    let mut out = std::collections::HashMap::new();
+    for entry in &index.entries {
+        if entry.stage() == 0 {
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            out.insert(path, entry.mode);
+        }
+    }
+    out
+}
+
+/// Stage-0 mode for `path`, or [`REGULAR_FILE_MODE`] when the path is not in the index.
+#[must_use]
+pub(crate) fn index_stage0_mode_or_regular(index: &Index, path: &str) -> u32 {
+    index
+        .get(path.as_bytes(), 0)
+        .map(|e| e.mode)
+        .unwrap_or(REGULAR_FILE_MODE)
+}
+
+/// Mode for `path` from the index, preferring stage 0 then merge stages (for unmerged paths).
+#[must_use]
+pub(crate) fn index_path_mode_for_pathspec(index: &Index, path: &str) -> u32 {
+    let path_bytes = path.as_bytes();
+    for stage in [0u8, 2, 3, 1] {
+        if let Some(entry) = index.get(path_bytes, stage) {
+            return entry.mode;
+        }
+    }
+    REGULAR_FILE_MODE
+}
+
+/// Object mode to use when matching a diff entry against a pathspec.
+#[must_use]
+pub(crate) fn diff_entry_path_mode(entry: &DiffEntry) -> u32 {
+    let new_mode = entry.new_mode.bits();
+    if new_mode != 0 {
+        new_mode
+    } else {
+        entry.old_mode.bits()
+    }
+}
+
+/// Pairs each of `paths` with its stage-0 mode in `index` ([`REGULAR_FILE_MODE`] when absent).
+///
+/// Lookups gallop forward through the index, so byte-sorted `paths` cost about one comparison
+/// each; any order is still correct.
+pub(crate) fn pathspec_entries_from_paths<'a>(
+    paths: &[&'a str],
+    index: Option<&Index>,
+) -> Vec<PathspecMatchEntry<'a>> {
+    let mut cursor = 0;
+    paths
+        .iter()
+        .map(|path| PathspecMatchEntry {
+            path,
+            mode: index
+                .and_then(|idx| {
+                    idx.find_stage0_pos_from(path.as_bytes(), &mut cursor)
+                        .map(|pos| idx.entries[pos].mode)
+                })
+                .unwrap_or(REGULAR_FILE_MODE),
+        })
+        .collect()
+}
+
+/// Whether positive pathspec `spec` matches at least one entry.
+///
+/// Uses the repository attribute stack when `spec` carries `:(attr:...)` magic, including
+/// `builtin_objectmode`, via [`PathspecMatcher::matches_entry`].
+///
+/// When `attr_matcher` is `Some`, it must have been built for `spec` alone (reuse within one
+/// operation); otherwise a matcher is built for this call.
+///
+/// # Errors
+///
+/// Propagates attribute pathspec validation failures from [`Repository::pathspec_matcher`].
+pub(crate) fn positive_spec_matches_any_entries(
+    repo: &Repository,
+    spec: &str,
+    entries: &[PathspecMatchEntry<'_>],
+    ctx: PathspecMatchContext,
+    attr_matcher: Option<&PathspecMatcher<'_>>,
+) -> Result<bool> {
+    if pathspec_is_exclude(spec) {
+        return Ok(true);
+    }
+    if pathspec_has_attr_magic(spec) {
+        let matches = |matcher: &PathspecMatcher<'_>| {
+            entries
+                .iter()
+                .any(|e| matcher.matches_entry(e.path, e.mode))
+        };
+        if let Some(matcher) = attr_matcher {
+            return Ok(matches(matcher));
+        }
+        let one = [spec.to_owned()];
+        let matcher = repo.pathspec_matcher(&one)?;
+        return Ok(matches(&matcher));
+    }
+    let list = [spec.to_owned()];
+    Ok(entries
+        .iter()
+        .any(|e| crate::pathspec::matches_pathspec_list_with_context(e.path, &list, ctx)))
+}
+
+/// Whether positive pathspec `spec` matches at least one path in `sorted_paths`.
+///
+/// When `index` is supplied, stage-0 modes are used for attribute matching.
+pub(crate) fn positive_pathspec_matches_any_path(
+    repo: &Repository,
+    spec: &str,
+    sorted_paths: &[&str],
+    index: Option<&Index>,
+    ctx: PathspecMatchContext,
+    attr_matcher: Option<&PathspecMatcher<'_>>,
+) -> Result<bool> {
+    if !pathspec_has_attr_magic(spec) {
+        return Ok(sorted_paths_match_pathspec(spec, sorted_paths, ctx));
+    }
+    let entries = pathspec_entries_from_paths(sorted_paths, index);
+    positive_spec_matches_any_entries(repo, spec, &entries, ctx, attr_matcher)
+}
+
+/// A pathspec without glob characters or `:` magic, which may name a worktree file directly.
+fn is_literal_worktree_pathspec(resolved: &str) -> bool {
+    !has_glob_chars(resolved) && !resolved.starts_with(':') && !pathspec_is_exclude(resolved)
+}
+
+fn repo_pathspec_ignorecase(repo: &Repository) -> bool {
+    repo.config()
+        .snapshot()
+        .ok()
+        .is_some_and(|cfg| cfg.ignore_case())
+}
+
+fn known_paths(repo: &Repository) -> Result<Vec<String>> {
+    let index = repo.load_index()?;
+    let mut set = HashSet::<String>::new();
+    for entry in &index.entries {
+        if entry.stage() == 0 {
+            set.insert(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+    }
+    set.extend(sorted_head_tree_paths(repo)?);
+    let mut known: Vec<String> = set.into_iter().collect();
+    known.sort_unstable();
+    Ok(known)
+}
+
+/// Every non-tree path in `HEAD`'s tree, sorted in byte order (empty on an unborn branch).
+///
+/// # Errors
+///
+/// Propagates failures resolving `HEAD` or reading its commit and trees.
+pub(crate) fn sorted_head_tree_paths(repo: &Repository) -> Result<Vec<String>> {
+    let Some(head_tree) = resolve_head_for_repository(repo)?.tree(repo.odb())? else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::new();
+    collect_tree_paths(repo, head_tree, "", &mut paths)?;
+    paths.sort_unstable();
+    Ok(paths)
+}
+
+fn collect_tree_paths(
+    repo: &Repository,
+    tree_oid: ObjectId,
+    prefix: &str,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let obj = repo.odb().read(&tree_oid)?;
+    for entry in parse_tree(&obj.data)? {
+        let name = String::from_utf8_lossy(&entry.name);
+        let path = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.mode == MODE_TREE {
+            collect_tree_paths(repo, entry.oid, &path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::RepositoryOptions;
+    use crate::repo::Repository;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn unknown_literal_pathspec_does_not_match_empty_repo() {
+        let dir = TempDir::new().expect("tempdir");
+        crate::repo::init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("discover");
+        assert!(!pathspec_matches_known_in_repository(&repo, "does-not-exist").expect("check"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn literal_pathspec_through_symlink_dir_is_not_known() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("tempdir");
+        crate::repo::init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        std::fs::create_dir_all(dir.path().join("real")).expect("mkdir");
+        std::fs::write(dir.path().join("real/f"), b"x").expect("write");
+        symlink("real", dir.path().join("dl")).expect("symlink");
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("discover");
+        assert!(
+            !pathspec_matches_known_in_repository(&repo, "dl/f").expect("check"),
+            "must not follow symlink directory for pathspec matching"
+        );
+    }
+
+    fn repo_with_commit(dir: &TempDir, files: &[&str]) -> Repository {
+        use crate::porcelain::add::{stage, StageOptions};
+        use crate::porcelain::commit::{create_commit, CommitRequest};
+        use crate::progress::NullProgress;
+
+        crate::repo::init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        for rel in files {
+            let abs = dir.path().join(rel);
+            fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir");
+            fs::write(abs, b"x\n").expect("write");
+        }
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("discover");
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("stage");
+        let ident = "T <t@example.com> 1 +0000".to_owned();
+        create_commit(
+            &repo,
+            &CommitRequest {
+                message: "init".into(),
+                author: Some(ident.parse().expect("signature")),
+                committer: Some(ident.parse().expect("signature")),
+                ..Default::default()
+            },
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("commit");
+        repo
+    }
+
+    #[test]
+    fn checker_does_not_load_known_paths_for_existing_literal_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo = repo_with_commit(&dir, &["a.txt", "dir/b.txt"]);
+        let mut checker = KnownPathspecChecker::new(&repo);
+        checker.ensure("a.txt", "a.txt").expect("a.txt");
+        checker.ensure("dir/b.txt", "dir/b.txt").expect("dir/b.txt");
+        assert!(checker.matches("dir").expect("dir"));
+        assert!(checker.known.is_none(), "index and HEAD must not be read");
+    }
+
+    #[test]
+    fn checker_matches_tracked_paths_missing_from_worktree() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo = repo_with_commit(&dir, &["a.txt", "dir/b.txt", "dir/c.txt"]);
+        fs::remove_file(dir.path().join("a.txt")).expect("rm");
+        fs::remove_dir_all(dir.path().join("dir")).expect("rm dir");
+        let mut checker = KnownPathspecChecker::new(&repo);
+        checker
+            .ensure("a.txt", "a.txt")
+            .expect("deleted tracked file");
+        checker.ensure("dir", "dir").expect("deleted tracked dir");
+        assert!(checker.matches("dir/*.txt").expect("glob"));
+        assert!(checker.known.is_some());
+        let err = checker.ensure("nope", "nope").expect_err("unknown path");
+        assert!(matches!(err, Error::PathspecNoMatch { spec } if spec == "nope"));
+        assert!(!checker.matches("*.rs").expect("glob miss"));
+    }
+
+    #[test]
+    fn checker_evaluates_attr_pathspecs_against_gitattributes() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        fs::write(dir.path().join(".gitattributes"), "*.rs diff=rust\n").expect("write");
+        let repo = repo_with_commit(&dir, &["src/a.rs", "b.txt"]);
+        let mut checker = KnownPathspecChecker::new(&repo);
+        checker
+            .ensure(":(attr:diff=rust)", ":(attr:diff=rust)")
+            .expect("rust file is known");
+        assert!(checker.matches(":(attr:diff=rust)src").expect("check"));
+        assert!(!checker.matches(":(attr:diff=rust)b.txt").expect("check"));
+        let err = checker
+            .ensure(":(attr:diff=go)", ":(attr:diff=go)")
+            .expect_err("no go files");
+        assert!(matches!(err, Error::PathspecNoMatch { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn checker_rejects_literal_path_through_symlink_dir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("tempdir");
+        let repo = repo_with_commit(&dir, &["real/f"]);
+        symlink("real", dir.path().join("dl")).expect("symlink");
+        let mut checker = KnownPathspecChecker::new(&repo);
+        let err = checker.ensure("dl/f", "dl/f").expect_err("beyond symlink");
+        assert!(matches!(err, Error::PathspecBeyondSymlink { spec } if spec == "dl/f"));
+        assert!(!checker.matches("dl/f").expect("check"));
+        checker.ensure("real/f", "real/f").expect("real path");
+    }
+
+    #[test]
+    fn literal_pathspec_matches_worktree_file() {
+        let dir = TempDir::new().expect("tempdir");
+        crate::repo::init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        fs::write(dir.path().join("tracked.txt"), b"x").expect("write");
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("discover");
+        assert!(pathspec_matches_known_in_repository(&repo, "tracked.txt").expect("check"));
+    }
+
+    fn index_entry(path: &str, mode: u32) -> crate::index::IndexEntry {
+        crate::index::IndexEntry {
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: ObjectId::from_bytes(&[0u8; 20]).expect("oid"),
+            flags: path.len().min(0xFFF) as u16,
+            flags_extended: None,
+            path: path.as_bytes().to_vec(),
+            base_index_pos: 0,
+        }
+    }
+
+    #[test]
+    fn pathspec_entries_take_stage0_modes_in_any_order() {
+        use crate::index::{MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK};
+        let mut index = Index::new();
+        index.add_or_replace(index_entry("a/run.sh", MODE_EXECUTABLE));
+        index.add_or_replace(index_entry("b/link", MODE_SYMLINK));
+        index.add_or_replace(index_entry("c/sub", MODE_GITLINK));
+        let modes = |paths: &[&str]| -> Vec<u32> {
+            pathspec_entries_from_paths(paths, Some(&index))
+                .iter()
+                .map(|e| e.mode)
+                .collect()
+        };
+        assert_eq!(
+            modes(&["a/run.sh", "b/link", "b/missing", "c/sub"]),
+            [
+                MODE_EXECUTABLE,
+                MODE_SYMLINK,
+                REGULAR_FILE_MODE,
+                MODE_GITLINK
+            ]
+        );
+        assert_eq!(
+            modes(&["c/sub", "a/run.sh", "zzz", "b/link"]),
+            [
+                MODE_GITLINK,
+                MODE_EXECUTABLE,
+                REGULAR_FILE_MODE,
+                MODE_SYMLINK
+            ]
+        );
+        let without_index: Vec<u32> = pathspec_entries_from_paths(&["a/run.sh"], None)
+            .iter()
+            .map(|e| e.mode)
+            .collect();
+        assert_eq!(without_index, [REGULAR_FILE_MODE]);
+    }
+
+    /// Stash push and restore check every pathspec against all tracked paths; a plain spec must
+    /// not pay for per-path index mode lookups, and attribute specs must stay linear.
+    #[test]
+    fn positive_pathspec_index_lookups_stay_linear_in_path_count() {
+        use crate::index::index_path_cmp;
+        const N: usize = 20_000;
+        const SPECS: usize = 100;
+        let dir = TempDir::new().expect("tempdir");
+        let repo = repo_with_commit(&dir, &["seed.txt"]);
+        let mut index = Index::new();
+        let owned: Vec<String> = (0..N).map(|i| format!("d/f{i:06}.txt")).collect();
+        for path in &owned {
+            index.add_or_replace(index_entry(path, REGULAR_FILE_MODE));
+        }
+        let paths: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let ctx = repo.pathspec_match_context();
+
+        index_path_cmp::reset();
+        for i in 0..SPECS {
+            let spec = format!("d/f{:06}.txt", i * 7);
+            assert!(positive_pathspec_matches_any_path(
+                &repo,
+                &spec,
+                &paths,
+                Some(&index),
+                ctx,
+                None
+            )
+            .expect("plain spec"));
+        }
+        assert_eq!(
+            index_path_cmp::take(),
+            0,
+            "plain pathspecs must not look paths up in the index"
+        );
+
+        index_path_cmp::reset();
+        let entries = pathspec_entries_from_paths(&paths, Some(&index));
+        assert_eq!(entries.len(), N);
+        let cmps = index_path_cmp::take();
+        assert!(
+            cmps < 8 * N,
+            "sorted mode lookups used {cmps} index comparisons for {N} paths"
+        );
+    }
+}
