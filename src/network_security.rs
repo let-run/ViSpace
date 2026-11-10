@@ -188,20 +188,15 @@ impl crate::store::Store {
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }
+    pub fn network_revoked(&self, id: &str) -> bool {
+        self.security.ledger.revoked(self.application_id(), id)
+    }
     pub fn network_authorize(&mut self, public: String, revoke: bool) -> Result<()> {
         ensure!(
             self.network_trusted(self.application_id()),
             "This identity has been revoked"
         );
         let mut action = self.security.identity.membership(public, revoke)?;
-        ensure!(
-            revoke
-                || !self
-                    .security
-                    .ledger
-                    .revoked(self.application_id(), &action.subject),
-            "This key is permanently revoked; a new identity is required to rejoin"
-        );
         if !revoke && self.network_trusted(&action.subject) {
             return Ok(());
         }
@@ -213,8 +208,10 @@ impl crate::store::Store {
                         .insert(crate::network_identity::record_fingerprint(&r)?);
                 }
             }
-            self.security.identity.sign_membership(&mut action)?;
+        } else {
+            self.security.ledger.reinstate(self.application_id(), &mut action);
         }
+        self.security.identity.sign_membership(&mut action)?;
         ensure!(
             action.subject != self.application_id(),
             "Cannot change your own membership"

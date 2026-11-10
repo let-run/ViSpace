@@ -16,6 +16,27 @@ test("base addresses select the sync endpoint",()=>{const f=fixture();assert.equ
 
 test('a browser reports an old Raft peer',async()=>{const f=fixture();f.socket.onmessage({data:JSON.stringify({type:'hello',version:6,application_id:remote,clock:{},cluster:remote})});await f.tick();assert.match(f.network.statuses()[0].status,/Raft sync has been removed/);});
 
+test('a protocol mismatch remains visible after close and stops automatic reconnect',async()=>{
+ const f=fixture();
+ f.socket.onmessage({data:JSON.stringify({type:'hello',version:8,application_id:remote,clock:{}})});
+ f.socket.onclose();
+ await f.tick();
+ assert.match(f.network.statuses()[0].status,/browser 9, desktop 8/);
+ assert.equal(f.network.canReconnect('wss://localhost/sync'),false);
+ f.network.connect('wss://localhost');
+ assert.equal(f.network.canReconnect('wss://localhost'),true);
+});
+
+test('a desktop rejection received before hello survives socket closure',async()=>{
+ const f=fixture();
+ const message='Branches have diverged. Choose Reconnect branches in Sync.';
+ f.socket.onmessage({data:JSON.stringify({type:'error',message})});
+ f.socket.onclose();
+ await f.tick();
+ assert.equal(f.network.statuses()[0].status,message);
+ assert.equal(f.network.canReconnect('wss://localhost'),false);
+});
+
 test('bundle availability wakes waiting transport without disconnecting sync',async()=>{
  const f=fixture();let wakes=0;f.network.a.bundleReady=()=>wakes++;
  f.socket.onmessage({data:JSON.stringify({type:'hello',version:9,application_id:remote,clock:{}})});await f.tick();

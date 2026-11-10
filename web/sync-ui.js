@@ -157,8 +157,9 @@ export function installSyncUI() {
     .filter(id => {
      if (id === state.applicationId) return false;
      const member = known.get(id);
-     return member?.expires_at == null || member.expires_at > now || (!member.revoked
-       && (addresses.has(id) || active.some(peer => peer.pairingId === id || peer.peerId === id)));
+     return member?.expires_at == null || member.expires_at > now
+       || active.some(peer => peer.pairingId === id || peer.peerId === id)
+       || addresses.has(id);
     })
     .sort((a, b) => Number(!!known.get(b)?.trusted) - Number(!!known.get(a)?.trusted) || a.localeCompare(b));
   const rows = ids.map(id => {
@@ -217,8 +218,8 @@ export function installSyncUI() {
      controls.append(revoke);
      if (focusAction === id) revoke.focus();
     }
-   } else if (member && !member.revoked) {
-    const approve = action('Approve', () => operation('authorize', {public_key: member.public_key}));
+   } else if (member) {
+    const approve = action(member.revoked ? 'Approve again' : 'Approve', () => operation('authorize', {public_key: member.public_key}));
     approve.title = 'Verify the node ID before approving';
     controls.append(approve);
    }

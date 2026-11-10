@@ -12,9 +12,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux build dependencies
+        timeout-minutes: 8
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang libclang-dev pkg-config libdbus-1-dev libudev-dev libxkbcommon-dev libwayland-dev
+          packages=(build-essential clang libclang-dev pkg-config libdbus-1-dev libudev-dev libxkbcommon-dev libwayland-dev)
+          missing=()
+          for package in "${packages[@]}"; do
+            if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null)" != 'install ok installed' ]]; then
+              missing+=("$package")
+            fi
+          done
+          if (( ${#missing[@]} == 0 )); then
+            echo "Linux build dependencies are already installed."
+            exit 0
+          fi
+          echo "Installing: ${missing[*]}"
+          apt_options=(-o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=15)
+          sudo -n apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo -n apt-get "${apt_options[@]}" install -y "${missing[@]}"
       - name: Set up Rust and the browser target
         shell: bash
         run: |

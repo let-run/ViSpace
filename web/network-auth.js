@@ -19,7 +19,7 @@ export class NetworkAuth {
   p.authProven = true;
   this.pending.set(a.node_id, [a.public_key, Date.now()]);
   p.status = 'Waiting for approval';
-  if (p.approveRemote && !this.i.trusted(a.node_id)) {
+  if (p.approveRemote && this.i.trusted(this.i.id()) && !this.i.trusted(a.node_id) && !this.i.revoked(a.node_id)) {
    this.authorize(a.public_key, false);
   } else {
    this.changed();

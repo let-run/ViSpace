@@ -32,7 +32,7 @@ elif [ "$(uname -s)" != Darwin ]; then
   exit 1
 fi
 if [ "$(uname -s)" = Darwin ]; then
-  APP="$ROOT/dist/ViSpace.app"
+  APP="${VISPACE_APP_BUNDLE:-$ROOT/dist/ViSpace.app}"
   mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
   # Replace the executable atomically so macOS does not retain a stale code-signature cache.
   cp "$BIN_DIR/vispace" "$APP/Contents/MacOS/vispace.new"

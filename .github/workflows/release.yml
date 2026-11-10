@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Compile desktop binaries on Linux
-    runs-on: [self-hosted, Linux, X64, vispace-release]
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -32,18 +32,70 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Compile all release targets
-        run: ./script/cross_build_release.sh "$RUNNER_TEMP/vispace-release-binaries"
+  build:
+    name: Compile desktop binaries for ${{ matrix.platform }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: macos, runner: macos-15, native: aarch64-apple-darwin, cross: x86_64-apple-darwin }
+          - { platform: linux, runner: ubuntu-24.04, native: x86_64-unknown-linux-gnu, cross: aarch64-unknown-linux-gnu }
+          - { platform: windows, runner: windows-2025, native: x86_64-pc-windows-msvc, cross: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux native and ARM64 build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i '/^Architectures:/d; /^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          sudo tee /etc/apt/sources.list.d/ubuntu-arm64.sources >/dev/null <<'SOURCES'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-security
+          Components: main universe
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          SOURCES
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libdbus-1-dev libudev-dev libxkbcommon-dev libwayland-dev \
+            libdbus-1-dev:arm64 libudev-dev:arm64 libxkbcommon-dev:arm64 libwayland-dev:arm64
+
+      - name: Compile both architectures
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.native }}
+          CROSS_TARGET: ${{ matrix.cross }}
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+        run: |
+          rustup toolchain install stable --profile minimal --target "$NATIVE_TARGET" --target "$CROSS_TARGET"
+          suffix=
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          for target in "$NATIVE_TARGET" "$CROSS_TARGET"; do
+            cargo build --locked --release --bins --target "$target"
+            output="release-binaries/$target/release"
+            mkdir -p "$output"
+            cp "target/$target/release/vispace$suffix" "target/$target/release/vispace-discovery$suffix" "$output/"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-binaries
-          path: ${{ runner.temp }}/vispace-release-binaries/
+          name: desktop-binaries-${{ matrix.platform }}
+          path: release-binaries/
           if-no-files-found: error
 
   package:
     name: Package ${{ matrix.platform }} ${{ matrix.arch }}
-    needs: build
+    needs: [version, build]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -58,13 +110,13 @@ jobs:
     env:
       RUST_TARGET: ${{ matrix.target }}
       PACKAGE_ARCH: ${{ matrix.arch }}
-      VISPACE_PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+      VISPACE_PACKAGE_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: desktop-binaries
+          name: desktop-binaries-${{ matrix.platform }}
           path: target
 
       - name: Prepare package output

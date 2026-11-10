@@ -39,6 +39,8 @@ pub struct Membership {
     pub timestamp_ms: u64,
     #[serde(default)]
     pub accepted_records: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reinstates: BTreeSet<String>,
     pub proof: Proof,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -139,6 +141,7 @@ impl Identity {
             revoked,
             timestamp_ms: crate::action_log::timestamp_now(),
             accepted_records: BTreeSet::new(),
+            reinstates: BTreeSet::new(),
             proof: Proof {
                 public_key: String::new(),
                 signature: String::new(),
@@ -186,7 +189,11 @@ pub fn verify_record(record: &crate::action_log::Record) -> Result<String> {
 }
 impl Membership {
     fn payload(&self) -> serde_json::Value {
-        serde_json::json!({"id":self.id,"issuer":self.issuer,"subject":self.subject,"public_key":self.public_key,"revoked":self.revoked,"timestamp_ms":self.timestamp_ms,"accepted_records":self.accepted_records})
+        let mut payload = serde_json::json!({"id":self.id,"issuer":self.issuer,"subject":self.subject,"public_key":self.public_key,"revoked":self.revoked,"timestamp_ms":self.timestamp_ms,"accepted_records":self.accepted_records});
+        if !self.reinstates.is_empty() {
+            payload["reinstates"] = serde_json::json!(self.reinstates);
+        }
+        payload
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -242,26 +249,64 @@ impl Ledger {
         }
         ever
     }
-    fn denied(&self, root: &str) -> BTreeSet<String> {
+    fn membership_state(&self, root: &str) -> (BTreeSet<String>, BTreeMap<String, &Membership>) {
         let ever = self.historical_members(root);
-        let denied: BTreeSet<_> = self
+        let mut revocations: BTreeMap<_, _> = self
             .actions
             .values()
             .filter(|a| a.revoked && ever.contains(&a.issuer))
-            .map(|a| a.subject.clone())
+            .map(|a| (a.id.clone(), a))
             .collect();
-        denied
+        loop {
+            let denied: BTreeSet<_> = revocations.values().map(|a| a.subject.as_str()).collect();
+            let mut members = BTreeSet::new();
+            if !denied.contains(root) {
+                members.insert(root.to_owned());
+            }
+            loop {
+                let before = members.len();
+                for a in self.actions.values() {
+                    if !a.revoked && !denied.contains(a.subject.as_str()) && members.contains(&a.issuer) {
+                        members.insert(a.subject.clone());
+                    }
+                }
+                if members.len() == before {
+                    break;
+                }
+            }
+            let before = revocations.len();
+            for grant in self.actions.values() {
+                // A revoked local node still needs to recognize its own reinstatement.
+                let authorized = members.contains(&grant.issuer)
+                    || (grant.subject == root && denied.contains(root)
+                        && ever.contains(&grant.issuer) && !denied.contains(grant.issuer.as_str()));
+                if !grant.revoked && grant.issuer != grant.subject && authorized {
+                    for id in &grant.reinstates {
+                        if revocations.get(id).is_some_and(|revoke| revoke.subject == grant.subject) {
+                            revocations.remove(id);
+                        }
+                    }
+                }
+            }
+            if revocations.len() == before {
+                return (members, revocations);
+            }
+        }
     }
     pub fn revoked(&self, root: &str, id: &str) -> bool {
-        self.denied(root).contains(id)
+        self.membership_state(root).1.values().any(|a| a.subject == id)
+    }
+    pub fn reinstate(&self, root: &str, action: &mut Membership) {
+        action.reinstates = self.membership_state(root).1.into_iter()
+            .filter_map(|(id, revoke)| (revoke.subject == action.subject).then_some(id))
+            .collect();
     }
     pub(crate) fn discover_peers(
         &self,
         root: &str,
         mut seen: BTreeMap<String, (String, u64)>,
     ) -> Vec<DiscoverPeer> {
-        let approved = self.members(root);
-        let historical_members = self.historical_members(root);
+        let (approved, active_revocations) = self.membership_state(root);
         let mut revoked = BTreeMap::<String, u64>::new();
         for action in self.actions.values() {
             for (id, key) in [
@@ -271,7 +316,7 @@ impl Ledger {
                 let peer = seen.entry(id.clone()).or_insert_with(|| (key.clone(), 0));
                 peer.1 = peer.1.max(action.timestamp_ms);
             }
-            if action.revoked && historical_members.contains(&action.issuer) {
+            if active_revocations.contains_key(&action.id) {
                 revoked.entry(action.subject.clone())
                     .and_modify(|time| *time = (*time).min(action.timestamp_ms))
                     .or_insert(action.timestamp_ms);
@@ -291,52 +336,22 @@ impl Ledger {
         }).collect()
     }
     pub fn merge_for(&mut self, root: &str, actions: Vec<Membership>) -> Result<bool> {
-        let denied = self.denied(root);
-        ensure!(
-            actions
-                .iter()
-                .all(|a| self.actions.contains_key(&a.id) || !denied.contains(&a.issuer)),
-            "New membership action from a revoked identity rejected"
-        );
+        let denied: BTreeSet<_> = self.membership_state(root).1.values().map(|a| a.subject.clone()).collect();
+        if actions.iter().any(|a| !self.actions.contains_key(&a.id) && denied.contains(&a.issuer)) {
+            let mut next = self.clone();
+            next.merge(actions.iter().filter(|a| !denied.contains(&a.issuer)).cloned().collect())?;
+            let restored = next.members(root);
+            ensure!(
+                actions
+                    .iter()
+                    .all(|a| self.actions.contains_key(&a.id) || !denied.contains(&a.issuer) || restored.contains(&a.issuer)),
+                "New membership action from a revoked identity rejected"
+            );
+        }
         self.merge(actions)
     }
     pub fn members(&self, root: &str) -> BTreeSet<String> {
-        let mut members = BTreeSet::from([root.to_owned()]);
-        // Grants form a delegation graph. No self-signed remote root becomes trusted automatically.
-        loop {
-            let before = members.len();
-            for a in self.actions.values() {
-                if !a.revoked && members.contains(&a.issuer) {
-                    members.insert(a.subject.clone());
-                }
-            }
-            if members.len() == before {
-                break;
-            }
-        }
-        let revoked: BTreeSet<_> = self
-            .actions
-            .values()
-            .filter(|a| a.revoked && members.contains(&a.issuer))
-            .map(|a| a.subject.clone())
-            .collect();
-        // Recompute reachability so a revoked member cannot sponsor new nodes.
-        members = BTreeSet::new();
-        if !revoked.contains(root) {
-            members.insert(root.into());
-        }
-        loop {
-            let before = members.len();
-            for a in self.actions.values() {
-                if !a.revoked && !revoked.contains(&a.subject) && members.contains(&a.issuer) {
-                    members.insert(a.subject.clone());
-                }
-            }
-            if members.len() == before {
-                break;
-            }
-        }
-        members
+        self.membership_state(root).0
     }
     pub fn trusted(&self, root: &str, id: &str) -> bool {
         self.members(root).contains(id)
@@ -425,6 +440,9 @@ impl BrowserIdentity {
     pub fn trusted(&self, id: &str) -> bool {
         self.ledger.trusted(&self.id(), id)
     }
+    pub fn revoked(&self, id: &str) -> bool {
+        self.ledger.revoked(&self.id(), id)
+    }
     pub fn merge(&mut self, actions: &str) -> Result<bool, wasm_bindgen::JsValue> {
         (|| -> Result<_> {
             self.ledger
@@ -447,10 +465,7 @@ impl BrowserIdentity {
         (|| -> Result<_> {
             ensure!(self.trusted(&self.id()), "This identity has been revoked");
             let mut m = self.identity.membership(public.into(), revoked)?;
-            ensure!(
-                revoked || !self.ledger.revoked(&self.id(), &m.subject),
-                "This key is permanently revoked; a new identity is required to rejoin"
-            );
+            ensure!(m.subject != self.id(), "Cannot change your own membership");
             if !revoked && self.trusted(&m.subject) {
                 return Ok(());
             }
@@ -460,8 +475,10 @@ impl BrowserIdentity {
                         m.accepted_records.insert(record_fingerprint(&r)?);
                     }
                 }
-                self.identity.sign_membership(&mut m)?;
+            } else {
+                self.ledger.reinstate(&self.id(), &mut m);
             }
+            self.identity.sign_membership(&mut m)?;
             self.ledger.merge(vec![m])?;
             Ok(())
         })()
@@ -494,6 +511,37 @@ fn js_error(e: anyhow::Error) -> wasm_bindgen::JsValue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_reapproval_restores_the_same_identity_without_undoing_later_revokes() -> Result<()> {
+        let owner = Identity::generate();
+        let peer = Identity::generate();
+        let (owner_id, peer_id) = (owner.id()?, peer.id()?);
+        let peer_key = peer.public_key()?;
+        let revoke = owner.membership(peer_key.clone(), true)?;
+        let mut ledger = Ledger::default();
+        ledger.merge(vec![
+            owner.membership(peer_key.clone(), false)?,
+            peer.membership(owner.public_key()?, false)?,
+            revoke.clone(),
+            owner.membership(peer_key.clone(), false)?,
+        ])?;
+        assert!(ledger.revoked(&owner_id, &peer_id));
+        assert!(!ledger.trusted(&peer_id, &peer_id));
+
+        let mut approval = owner.membership(peer_key.clone(), false)?;
+        ledger.reinstate(&owner_id, &mut approval);
+        owner.sign_membership(&mut approval)?;
+        ledger.merge_for(&peer_id, vec![approval.clone()])?;
+        assert!(ledger.trusted(&owner_id, &peer_id));
+        assert!(ledger.trusted(&peer_id, &owner_id));
+        assert!(!ledger.revoked(&owner_id, &peer_id));
+
+        ledger.merge_for(&owner_id, vec![owner.membership(peer_key, true)?])?;
+        ledger.merge_for(&owner_id, vec![approval])?;
+        assert!(ledger.revoked(&owner_id, &peer_id));
+        Ok(())
+    }
+
     #[test]
     fn discovery_expiry_keeps_approved_peers_and_preserves_revocation() -> Result<()> {
         use super::*;

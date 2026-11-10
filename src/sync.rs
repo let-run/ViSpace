@@ -225,7 +225,7 @@ async fn peer<S: AsyncRead + AsyncWrite + Unpin + Send>(
     .await
     .context("Sync handshake send timed out")??;
     let (tx, mut rx) = mpsc::channel::<Message>(4);
-    let writer = async move {
+    let writer = async {
         while let Some(message) = rx.recv().await {
             tokio::time::timeout(IO_TIMEOUT, sink.send(message))
                 .await
@@ -473,7 +473,23 @@ async fn peer<S: AsyncRead + AsyncWrite + Unpin + Send>(
         };
         tokio::select! {result=producer=>result,result=reader=>result,result=bundles=>result}
     };
-    tokio::select! {result=writer=>result,result=receiver=>result}
+    let result = tokio::select! {result=writer=>result,result=receiver=>result};
+    if let Err(error) = &result {
+        // Share actionable protocol rejections without exposing local storage errors.
+        let detail = error.to_string();
+        let message = match detail.as_str() {
+            RAFT_REMOVED
+            | "Sync requires protocol version 9 on both apps"
+            | "Enable the same sync mode on both desktops"
+            | "Branches have diverged. Choose Reconnect branches in Sync."
+            | "Peer authorization revoked" => detail,
+            _ => "Desktop sync failed. Check the desktop Sync log for details.".into(),
+        };
+        let frame = Message::Text(serde_json::to_string(&Control::Error { message })?.into());
+        let _ = tokio::time::timeout(IO_TIMEOUT, sink.send(frame)).await;
+        let _ = tokio::time::timeout(IO_TIMEOUT, sink.close()).await;
+    }
+    result
 }
 async fn produce(
     tx: &mpsc::Sender<Message>,

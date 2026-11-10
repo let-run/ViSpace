@@ -330,7 +330,7 @@ setInterval(()=>{
   if(bridge||network.statuses().some(peer=>peer.active))return;
   const address=db.selectValue('SELECT address FROM sync_connection WHERE singleton=1');
   const joinedHead=db.selectValue('SELECT hash FROM sync_connection_head WHERE singleton=1');
-  if(address&&joinedHead===appliedHead&&!pending())network.connect(address,db.selectValue('SELECT node_id FROM sync_connection_identity WHERE address=?',[address])??null);
+  if(address&&joinedHead===appliedHead&&!pending()&&network.canReconnect(address))network.connect(address,db.selectValue('SELECT node_id FROM sync_connection_identity WHERE address=?',[address])??null);
  }).catch(()=>{});
 },5000);
 let dispatching=false;

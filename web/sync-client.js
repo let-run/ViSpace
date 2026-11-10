@@ -1,4 +1,4 @@
-// Protocol 8: approved P-256 peers authenticate before hello; immutable files precede compressed events; clients pull before publishing.
+// Approved P-256 peers authenticate before hello; files precede events and clients pull before publishing.
 const encoder=new TextEncoder(),decoder=new TextDecoder('utf-8',{fatal:true});
 const MAGIC=encoder.encode('BOMBLB01'),MAX=64*1024*1024;
 export function crc32(bytes){let crc=0xffffffff;for(const b of bytes){crc^=b;for(let i=0;i<8;i++)crc=(crc>>>1)^((crc&1)?0xedb88320:0);}return(crc^0xffffffff)>>>0;}
@@ -13,6 +13,7 @@ export class SyncNetwork {
  constructor(adapter,Socket=globalThis.WebSocket){this.a=adapter;this.Socket=Socket;this.peers=new Map();this.serial=0;this.heartbeat=setInterval(()=>{if(this.a.topologyTick?.()||this.a.component?.())this.changed();},20000);this.heartbeat.unref?.();}
  connected(){return [...this.peers.values()].some(peer=>peer.active&&peer.authenticated&&peer.socket.readyState===1);}
  pulling(){return [...this.peers.values()].some(p=>p.active&&p.authenticated&&!p.ready);}
+ canReconnect(url){const origin=new URL(url).origin;return ![...this.peers.values()].some(p=>p.url===origin&&p.retryBlocked);}
  bundlePeers(){return [...this.peers.values()].filter(p=>p.active&&p.ready&&p.gitBundleGrant).map(p=>({url:p.url,grant:p.gitBundleGrant}));}
  statuses(){return [...this.peers.values()].map(({id,url,status,peerId,head,active,ready,gitBundleGrant,authPeer,authProven})=>({id,url,status,peerId,pairingId:authProven?authPeer.node_id:undefined,head,active,ready,gitBundles:!!gitBundleGrant}));}
  authenticated(p){if(p.authenticated)return;p.authenticated=true;clearTimeout(p.authDeadline);const v=this.a.view();this.send(p,{type:'hello',version:syncVersion,application_id:this.a.identity(),git_bundle_notifications:true,clock:v.clock,component:!!this.a.component?.(),browser:true,head:this.a.component?.()?v.head:v.sharedHead,topology:this.a.topologyAds?.()??[]});}
@@ -26,8 +27,9 @@ export class SyncNetwork {
     let message;try{message=JSON.parse(event.data);}catch{}
     if(message?.type==='save_result'&&message.id===p.proposal.id){p.proposal.finish({...message.outcome,record:message.record});return;}
    }run(()=>this.receive(p,event.data));};
-  socket.onerror=()=>this.fail(p,Error('Connection failed'));
-  socket.onclose=()=>{if(p.active){p.active=false;p.status='Disconnected';this.unlink(p);this.changed();}};this.changed();return p.id;
+  // Let queued messages, including a final peer error, finish before reporting the close.
+  socket.onerror=()=>run(()=>this.fail(p,Error('Connection failed')));
+  socket.onclose=event=>run(()=>{if(p.active){p.active=false;p.status=event?.reason||'Disconnected';this.unlink(p);this.changed();}});this.changed();return p.id;
  }
  disconnect(id){const p=this.peers.get(id);if(p){p.active=false;p.status='Disconnected';this.unlink(p);p.socket.close();this.changed();}}
  unlink(p){clearTimeout(p.authDeadline);p.proposal?.finish({result:'unavailable'});if(p.topologyConnected){p.topologyConnected=false;this.a.topologyDisconnect?.(p.peerId);}}
@@ -37,13 +39,18 @@ export class SyncNetwork {
  async receive(p,data){if(!p.active)return;
   if(!p.authenticated){if(typeof data!=='string')throw Error('Authentication required');const done=this.a.auth.receive(p,JSON.parse(data),m=>this.send(p,m));if(done)this.authenticated(p);this.changed();return;}
   if(typeof data==='string'){const m=JSON.parse(data);
-   if(m.type==='hello'){if(m.cluster!=null)throw Error('Raft sync has been removed. Upgrade this desktop to use Partition sync.');if(p.hello||m.version!==syncVersion||!nodeId.test(m.application_id)||m.application_id===this.a.identity()||m.application_id!==p.authPeer.node_id)throw Error('Incompatible peer or same application identity');
+   if(m.type==='error'){p.retryBlocked=true;throw Error(m.message);}
+   if(m.type==='hello'){
+    p.retryBlocked=true;
+    if(m.cluster!=null)throw Error('Raft sync has been removed. Upgrade this desktop to use Partition sync.');
+    if(m.version!==syncVersion)throw Error(`Sync protocol mismatch: browser ${syncVersion}, desktop ${m.version}. Update both apps to the same release.`);
+    if(p.hello||!nodeId.test(m.application_id)||m.application_id===this.a.identity()||m.application_id!==p.authPeer.node_id)throw Error('Incompatible peer or same application identity');
     if(m.component){
      if([...this.peers.values()].some(other=>other!==p&&other.active))throw Error('Partition sync uses one browser gateway. Reconnect branches from a desktop.');
      this.a.joinComponent?.();p.component=true;
     }else if(this.a.component?.())throw Error('This desktop does not use partition sync');
-    p.hello=true;p.gitBundleGrant=uuid.test(m.git_bundle_grant ?? "")?m.git_bundle_grant:null;p.peerId=m.application_id;p.head=m.head;p.clock=clock(m.clock);p.status='Receiving changes';this.a.topologyReceive?.(m.topology??[]);this.a.topologyConnect?.(p.peerId);p.topologyConnected=true;await this.a.notePeer(p.peerId,p.clock);}
-   else {if(!p.hello)throw Error('Peer did not introduce itself');if(m.type==='ready'){if(m.version!==syncVersion)throw Error('Incompatible sync version');p.clock=clock(m.clock);p.ready=true;p.status='Live';await this.a.notePeer(p.peerId,p.clock);}else if(m.type==='authority'&&p.component){if(m.leader!==null&&!nodeId.test(m.leader))throw Error('Invalid authority status');p.leader=m.leader;p.authoritySeen=Date.now();}else if(m.type==='save_result'&&p.component){}else if(m.type==='ack'){p.clock=clock(m.clock);await this.a.notePeer(p.peerId,p.clock);}else if(m.type==='membership'){if(this.a.auth.i.merge(JSON.stringify(m.actions)))this.a.auth.save();}else if(m.type==='git_bundle_ready'){if(uuid.test(m.git_bundle_grant??''))p.gitBundleGrant=m.git_bundle_grant;this.a.bundleReady?.();}else if(m.type==='topology'){this.a.topologyReceive?.(m.advertisements);}else if(m.type==='error')throw Error(m.message);else throw Error('Unknown sync message');}
+    p.hello=true;p.gitBundleGrant=uuid.test(m.git_bundle_grant ?? "")?m.git_bundle_grant:null;p.peerId=m.application_id;p.head=m.head;p.clock=clock(m.clock);p.status='Receiving changes';this.a.topologyReceive?.(m.topology??[]);this.a.topologyConnect?.(p.peerId);p.topologyConnected=true;await this.a.notePeer(p.peerId,p.clock);p.retryBlocked=false;}
+   else {if(!p.hello)throw Error('Peer did not introduce itself');if(m.type==='ready'){if(m.version!==syncVersion)throw Error('Incompatible sync version');p.clock=clock(m.clock);p.ready=true;p.status='Live';await this.a.notePeer(p.peerId,p.clock);}else if(m.type==='authority'&&p.component){if(m.leader!==null&&!nodeId.test(m.leader))throw Error('Invalid authority status');p.leader=m.leader;p.authoritySeen=Date.now();}else if(m.type==='save_result'&&p.component){}else if(m.type==='ack'){p.clock=clock(m.clock);await this.a.notePeer(p.peerId,p.clock);}else if(m.type==='membership'){if(this.a.auth.i.merge(JSON.stringify(m.actions)))this.a.auth.save();}else if(m.type==='git_bundle_ready'){if(uuid.test(m.git_bundle_grant??''))p.gitBundleGrant=m.git_bundle_grant;this.a.bundleReady?.();}else if(m.type==='topology'){this.a.topologyReceive?.(m.advertisements);}else throw Error('Unknown sync message');}
   } else {if(!p.hello)throw Error('Peer did not introduce itself');const bytes=new Uint8Array(data);if(isBlob(bytes)){const b=blobDecode(bytes);await this.a.putBlob(b.asset,b.bytes);}else{const record=this.a.decode(bytes);this.a.auth.i.verify_record(JSON.stringify(record));await this.a.receive(record);await this.a.notePeer(p.peerId,this.a.view().clock);this.send(p,{type:'ack',id:record.id,applied:true,clock:this.a.view().clock});}}
   this.changed();
  }

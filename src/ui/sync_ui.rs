@@ -207,7 +207,8 @@ impl SyncUi {
         ids.retain(|id| {
             let Some(node) = known.get(id) else { return true; };
             node.expires_at.is_none_or(|expires| expires > now)
-                || (!node.revoked && (nearby.contains_key(id) || self.peers.pairing.contains(*id)))
+                || self.peers.pairing.contains(*id)
+                || nearby.contains_key(id)
         });
         ids.sort_by_key(|id| (!known.get(id).is_some_and(|node| node.trusted), *id));
         if let Some(id) = self.revoking_id.as_deref()
@@ -284,7 +285,7 @@ impl SyncUi {
                             {
                                 connect = Some((address.to_owned(), id.to_owned()));
                             }
-                            if let Some(node) = known.filter(|node| !node.revoked) {
+                            if let Some(node) = known {
                                 if let Some(code) = self.peers.pairing_codes.get(id) {
                                     if let Some(code) = code {
                                         ui.label(RichText::new(code).monospace().strong().color(GOLD))
@@ -306,7 +307,7 @@ impl SyncUi {
                                     if ui.small_button("Revoke").on_hover_text("Revoke sync access").clicked() {
                                         self.revoking_id = Some(id.to_owned());
                                     }
-                                } else if ui.small_button("Approve").on_hover_text("Verify the node ID before approving").clicked() {
+                                } else if ui.small_button(if revoked { "Approve again" } else { "Approve" }).on_hover_text("Verify the node ID before approving").clicked() {
                                     membership = Some((node.public_key.clone(), false));
                                 }
                             }
