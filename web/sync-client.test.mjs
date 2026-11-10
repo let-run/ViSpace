@@ -37,6 +37,20 @@ test('a desktop rejection received before hello survives socket closure',async()
  assert.equal(f.network.canReconnect('wss://localhost'),false);
 });
 
+test('an unauthorized history record stops automatic reconnect without applying it',async()=>{
+ const f=fixture();
+ f.socket.onmessage({data:JSON.stringify({type:'hello',version:9,application_id:remote,clock:{}})});
+ await f.tick();
+ const reason=`Sync stopped: node ${remote} is revoked (action incoming)`;
+ f.network.a.auth.i.verify_record=()=>{throw reason;};
+ f.socket.onmessage({data:new Uint8Array([1]).buffer});
+ f.socket.onclose();
+ await f.tick();
+ assert.deepEqual(f.received,[]);
+ assert.equal(f.network.statuses()[0].status,reason);
+ assert.equal(f.network.canReconnect('wss://localhost'),false);
+});
+
 test('bundle availability wakes waiting transport without disconnecting sync',async()=>{
  const f=fixture();let wakes=0;f.network.a.bundleReady=()=>wakes++;
  f.socket.onmessage({data:JSON.stringify({type:'hello',version:9,application_id:remote,clock:{}})});await f.tick();

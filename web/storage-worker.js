@@ -125,6 +125,7 @@ async function init({legacy,folder,demo}){
  appliedHead=db.selectValue('SELECT hash FROM inventory_applied_head WHERE singleton=1')??'';
  revision=Number(db.selectValue('SELECT revision FROM browser_state WHERE id=1')||0);history=db.selectValues('SELECT payload FROM sync_events ORDER BY rowid').map(JSON.parse);const stored=db.selectValue('SELECT snapshot FROM browser_state WHERE id=1');
  snapshot=stored?JSON.parse(browser_storage_project_references(stored,false)):null;await recover();
+ if(security.replay_membership(JSON.stringify(history.filter(isMembershipRecord))))persistSecurity();
  if(component()){
   exec("UPDATE sync_authority SET cluster='component' WHERE singleton=1");
   const draft=JSON.parse(db.selectValue('SELECT payload FROM sync_pending WHERE singleton=1')||'null');
@@ -201,7 +202,7 @@ async function state(){const view=inspect(),draft=pending(),leader=network.leade
  const graph=topology?JSON.parse(topology.graph(performance.now())):null;if(graph){
   graph.managed=!!component();if(leader)graph.leader=leader;
  }if(hydratedBase!==snapshot){hydratedText=snapshot?JSON.stringify(await hydrate(snapshot)):null;hydratedBase=snapshot;}return {sync:{security:auth?.state(),topology:graph,bridge:bridge?{address:bridge.address,reviews:mergeRecords()}:null,component:component(),queued:componentQueue.length,leader,pending:draft?{outcome:draft.outcome,id:draft.record.id,comparisons,choices:draft.choices??{},ready:proposalReady(draft,comparisons)}:null,applicationId:identity(),head:view.head,appliedHead,sharedHead:view.sharedHead,reviews:(component()?[]:view.reviews).map((r,i)=>({...r,draft:db.selectValue('SELECT text FROM sync_merge_drafts WHERE id=?',[r.id])??JSON.stringify(view.drafts[i],null,2)})),warnings:view.warnings,peers:network.statuses(),pulling:network.pulling()},snapshot:hydratedText,revision,applicationId:db.selectValue('SELECT application_id FROM sync_identity WHERE singleton=1'),workspace:workspace?workspace.name:null,needsPermission:!!workspace&&!await workspaceWritable(workspace)};}
-async function save({next,expected,initial=false}){if(inspect().reviews.length)throw Error('Resolve the pending comparisons in Sync before editing.');if(expected!==revision)throw Error('Inventory changed while saving. Reload before editing.');await permission(workspace);const data=JSON.parse(next);for(const p of data.projects||[]){p.id||=crypto.randomUUID().toUpperCase();p.notesAttachmentID||='project-'+crypto.randomUUID().toUpperCase();}
+async function save({next,expected,initial=false}){if(!security.trusted(identity()))throw Error('This node has been revoked');if(inspect().reviews.length)throw Error('Resolve the pending comparisons in Sync before editing.');if(expected!==revision)throw Error('Inventory changed while saving. Reload before editing.');await permission(workspace);const data=JSON.parse(next);for(const p of data.projects||[]){p.id||=crypto.randomUUID().toUpperCase();p.notesAttachmentID||='project-'+crypto.randomUUID().toUpperCase();}
  const canonical=await externalize(data,snapshot);let record=JSON.parse(browser_storage_make(JSON.stringify(snapshot||empty()),JSON.stringify(canonical),JSON.stringify(history),component()?componentOrigin:identity()));record.initial=initial;
  if(component())record.mesh.author=identity();
  record=JSON.parse(security.sign_record(JSON.stringify(record)));
@@ -308,7 +309,8 @@ async function submitDraft(draft){
  const message=outcome?.result==='stale'?'The shared inventory changed. Review your draft in Sync.':outcome?.result==='invalid'?String(outcome.detail):'Waiting for a leader. Your edit is queued in Sync.';
  throw Error('Shared save: '+message);
 }
-async function accept(record,local=snapshot){if(record.mesh?.author===identity()||record.mesh?.origin===identity()){record=JSON.parse(security.sign_record(JSON.stringify(record)));}security.verify_record(JSON.stringify(record));if(record.version!==2||!record.mesh)throw Error('Mesh sync requires version 2 events');await permission(workspace);for(const id of assets(record))if(!await getBlob(id,true))throw Error('Event arrived before its attachment');const old=history.find(r=>r.id===record.id);const result=project([...history,record],local);if(!old){await append(record);commit(result);}if(pending()?.record.id===record.id)savePending(null);}
+function isMembershipRecord(record){return record.actions?.some(action=>action.entity==='network_membership');}
+async function accept(record,local=snapshot){if(record.mesh?.author===identity()||record.mesh?.origin===identity()){record=JSON.parse(security.sign_record(JSON.stringify(record)));}security.verify_record(JSON.stringify(record));if(record.version!==2||!record.mesh)throw Error('Mesh sync requires version 2 events');await permission(workspace);for(const id of assets(record))if(!await getBlob(id,true))throw Error('Event arrived before its attachment');const old=history.find(r=>r.id===record.id);const result=project([...history,record],local);if(!old){await append(record);commit(result);}if(isMembershipRecord(record)&&security.replay_membership(JSON.stringify([record])))auth.save();if(pending()?.record.id===record.id)savePending(null);}
 const network=new SyncNetwork({enqueue,identity,
  get auth(){return auth;},component,joinComponent,view:()=>inspect(),assets,
  topologyAds:()=>topology?JSON.parse(topology.ads(performance.now())):[],
@@ -359,8 +361,25 @@ self.onmessage=({data})=>{enqueue(async()=>{try{let value;switch(data.op){case'i
    conflicts: inspect().reviews.flatMap(review => review.events)
   };
   break;
- case'authorize':auth.authorize(data.public_key,false);network.changed();value=await state();break;
- case'revoke':auth.authorize(data.public_key,true);network.changed();value=await state();break;
+ case'authorize':
+ case'revoke':{
+  const revoke=data.op==='revoke';
+  if(!component()&&!revoke){
+   // This local trust anchor lets the browser authenticate its first gateway.
+   auth.authorize(data.public_key,false);
+  }else{
+   if(!network.leader())throw Error('Connect to the sync leader to change membership');
+   if(componentQueue.length)throw Error('Wait for pending edits before changing membership');
+   const inventory=JSON.stringify(snapshot||empty());
+   let record=JSON.parse(browser_storage_make(inventory,inventory,JSON.stringify(history),componentOrigin));
+   record.mesh.author=identity();
+   record.actions=[{entity:'network_membership_request',kind:revoke?'revoke':'approve',key:'',label:'',value:data.public_key,changes:[],position:null}];
+   record=JSON.parse(security.sign_record(JSON.stringify(record)));
+   const outcome=await network.propose(record);
+   if(outcome.result!=='committed')throw Error(outcome.detail||'The sync leader could not commit the membership change');
+  }
+  network.changed();value=await state();break;
+ }
  case'connect':{
   if(network.statuses().some(peer=>peer.active))throw Error('Disconnect the current desktop before connecting another one.');
   network.connect(data.url,data.expected_id??null,true);

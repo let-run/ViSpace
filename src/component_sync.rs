@@ -305,6 +305,35 @@ pub(crate) async fn submit(store: &WeakStore, draft: &Record) -> Result<Approval
     route_json(store, &leader, "component_propose", draft).await
 }
 
+pub(crate) async fn authorize_member(store: WeakStore, public: String, revoke: bool) -> Result<()> {
+    let draft = access(&store, move |s| {
+        if !s.uses_component() || s.component_leader().as_deref() == Some(s.application_id()) {
+            s.network_authorize(public, revoke)?;
+            return Ok(None);
+        }
+        let mut draft = s.make_membership_record()?;
+        draft.actions.push(action_log::Action {
+            kind: if revoke { "revoke" } else { "approve" }.into(),
+            entity: "network_membership_request".into(),
+            key: String::new(),
+            label: String::new(),
+            value: Some(public.into()),
+            changes: vec![],
+            position: None,
+        });
+        s.network_identity().sign_record(&mut draft)?;
+        Ok(Some(draft))
+    }).await?;
+    if let Some(draft) = draft {
+        match submit(&store, &draft).await?.result {
+            SaveResult::Committed => {}
+            SaveResult::Invalid(error) => bail!("{error}"),
+            _ => bail!("The sync leader could not commit the membership change. Try again."),
+        }
+    }
+    Ok(())
+}
+
 pub fn start(store: &SharedStore) -> Result<()> {
     {
         let mut store = store.lock().unwrap();
@@ -676,6 +705,62 @@ mod tests {
         store.lock().unwrap().component_leader()
     }
 
+    #[tokio::test]
+    async fn revocation_is_ordered_after_accepted_edits_and_blocks_the_next_proposal() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = node(root.path(), "owner");
+        let owner_id = owner.lock().unwrap().application_id().to_owned();
+        wait_for("owner elected", || leader(&owner).as_deref() == Some(&owner_id)).await;
+        let author = crate::network_identity::Identity::generate();
+        let author_id = author.id().unwrap();
+        let key = author.public_key().unwrap();
+        let mut owner = owner.lock().unwrap();
+        owner.network_authorize(key.clone(), false).unwrap();
+
+        let edit = |owner: &Store, description: &str| {
+            let mut mesh = crate::mesh::Mesh::default();
+            for event in owner.records_after(None).unwrap() {
+                mesh.insert(event).unwrap();
+            }
+            let attachments = owner.attachment_root();
+            let before = mesh.project(&attachments).unwrap();
+            let mut after = before.clone();
+            if after.parts.is_empty() {
+                after.save_part(Part { number: "R1".into(), ..Default::default() }).unwrap();
+            }
+            after.parts[0].description = description.into();
+            let sequence = mesh.clock.get(&author_id).copied().unwrap_or(0) + 1;
+            let mut record = mesh.make(&before, &after, &attachments, &author_id, sequence).unwrap();
+            author.sign_record(&mut record).unwrap();
+            record
+        };
+        for description in ["created", "modified"] {
+            let proposal = edit(&owner, description);
+            assert_eq!(owner.approve_component(&proposal).unwrap().result, SaveResult::Committed);
+        }
+        owner.network_authorize(key.clone(), true).unwrap();
+        let rejected = edit(&owner, "after revocation");
+        assert!(owner.approve_component(&rejected).is_err());
+        let events = owner.events_after(&Default::default()).unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].actions[0].kind, "node_approved");
+        assert_eq!(events[3].actions[0].kind, "node_revoked");
+        assert_eq!(events[3].mesh.as_ref().unwrap().context.get(&author_id), Some(&2));
+
+        let mut joiner = Store::open(root.path().join("joiner/inventory.sqlite")).unwrap();
+        joiner.network_bootstrap_peer(owner.network_identity().public_key().unwrap()).unwrap();
+        joiner.network_merge(owner.network_actions()).unwrap();
+        for event in events {
+            joiner.replay_record(&event, None).unwrap();
+        }
+        assert_eq!(joiner.data.parts[0].description, "modified");
+        assert!(joiner.network_revoked(&author_id));
+        owner.network_authorize(key, false).unwrap();
+        assert!(matches!(owner.approve_component(&rejected).unwrap().result, SaveResult::Invalid(_)));
+        let fresh = edit(&owner, "after reapproval");
+        assert_eq!(owner.approve_component(&fresh).unwrap().result, SaveResult::Committed);
+    }
+
     fn description(store: &SharedStore) -> String {
         store
             .lock()
@@ -738,7 +823,7 @@ mod tests {
         let a = node(root.path(), "a");
         let b = node(root.path(), "b");
         let c = node(root.path(), "c");
-        for (x,y) in [(&a,&b),(&b,&a),(&b,&c),(&c,&b)]{let key=y.lock().unwrap().network_identity().public_key().unwrap();x.lock().unwrap().network_authorize(key,false).unwrap();}
+        for (x,y) in [(&a,&b),(&b,&a),(&b,&c),(&c,&b)]{let key=y.lock().unwrap().network_identity().public_key().unwrap();x.lock().unwrap().network_bootstrap_peer(key).unwrap();}
         let host_b = endpoint(&b);
         let host_c = endpoint(&c);
         let address_c = format!("wss://{}", host_c.address);

@@ -51,7 +51,11 @@ export class SyncNetwork {
     }else if(this.a.component?.())throw Error('This desktop does not use partition sync');
     p.hello=true;p.gitBundleGrant=uuid.test(m.git_bundle_grant ?? "")?m.git_bundle_grant:null;p.peerId=m.application_id;p.head=m.head;p.clock=clock(m.clock);p.status='Receiving changes';this.a.topologyReceive?.(m.topology??[]);this.a.topologyConnect?.(p.peerId);p.topologyConnected=true;await this.a.notePeer(p.peerId,p.clock);p.retryBlocked=false;}
    else {if(!p.hello)throw Error('Peer did not introduce itself');if(m.type==='ready'){if(m.version!==syncVersion)throw Error('Incompatible sync version');p.clock=clock(m.clock);p.ready=true;p.status='Live';await this.a.notePeer(p.peerId,p.clock);}else if(m.type==='authority'&&p.component){if(m.leader!==null&&!nodeId.test(m.leader))throw Error('Invalid authority status');p.leader=m.leader;p.authoritySeen=Date.now();}else if(m.type==='save_result'&&p.component){}else if(m.type==='ack'){p.clock=clock(m.clock);await this.a.notePeer(p.peerId,p.clock);}else if(m.type==='membership'){if(this.a.auth.i.merge(JSON.stringify(m.actions)))this.a.auth.save();}else if(m.type==='git_bundle_ready'){if(uuid.test(m.git_bundle_grant??''))p.gitBundleGrant=m.git_bundle_grant;this.a.bundleReady?.();}else if(m.type==='topology'){this.a.topologyReceive?.(m.advertisements);}else throw Error('Unknown sync message');}
-  } else {if(!p.hello)throw Error('Peer did not introduce itself');const bytes=new Uint8Array(data);if(isBlob(bytes)){const b=blobDecode(bytes);await this.a.putBlob(b.asset,b.bytes);}else{const record=this.a.decode(bytes);this.a.auth.i.verify_record(JSON.stringify(record));await this.a.receive(record);await this.a.notePeer(p.peerId,this.a.view().clock);this.send(p,{type:'ack',id:record.id,applied:true,clock:this.a.view().clock});}}
+  } else {if(!p.hello)throw Error('Peer did not introduce itself');const bytes=new Uint8Array(data);if(isBlob(bytes)){const b=blobDecode(bytes);await this.a.putBlob(b.asset,b.bytes);}else{
+   const record=this.a.decode(bytes);
+   try{this.a.auth.i.verify_record(JSON.stringify(record));}
+   catch(error){p.retryBlocked=true;throw error;}
+   await this.a.receive(record);await this.a.notePeer(p.peerId,this.a.view().clock);this.send(p,{type:'ack',id:record.id,applied:true,clock:this.a.view().clock});}}
   this.changed();
  }
  leader(){return [...this.peers.values()].find(p=>p.active&&p.ready&&p.component&&p.leader&&Date.now()-p.authoritySeen<45000)?.leader??null;}

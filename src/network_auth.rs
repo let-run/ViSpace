@@ -170,7 +170,7 @@ pub(crate) async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
             && store.network_trusted(store.application_id())
             && !store.network_revoked(&remote)
         {
-            store.network_authorize(public_key.clone(), false)?;
+            store.network_bootstrap_peer(public_key.clone())?;
         }
         (store.begin_network_pairing(remote.clone()), host_request)
     };
@@ -240,15 +240,17 @@ async fn verify_pairing_code<S: AsyncRead + AsyncWrite + Unpin>(
             let Auth::AuthCodeAccepted { server_key } = read(ws).await? else {
                 bail!("Expected pairing confirmation");
             };
+            if let Some(pin) = &server_key {
+                ensure!(
+                    pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "Invalid peer TLS key"
+                );
+            }
+            crate::component_sync::authorize_member(
+                std::sync::Arc::downgrade(shared), public_key.to_owned(), false,
+            ).await?;
             {
                 let mut store = shared.lock().unwrap();
-                if let Some(pin) = &server_key {
-                    ensure!(
-                        pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
-                        "Invalid peer TLS key"
-                    );
-                }
-                store.network_authorize(public_key.to_owned(), false)?;
                 if let Some(pin) = server_key {
                     store.save_network_tls_pin(remote, None, &pin)?;
                 }
@@ -288,7 +290,7 @@ async fn verify_pairing_code<S: AsyncRead + AsyncWrite + Unpin>(
             );
             let mut store = shared.lock().unwrap();
             if store.network_trusted(store.application_id()) && !store.network_revoked(remote) {
-                store.network_authorize(public_key.to_owned(), false)?;
+                store.network_bootstrap_peer(public_key.to_owned())?;
             }
             store.save_network_tls_pin(remote, Some(&origin), &server_pin)?;
         }

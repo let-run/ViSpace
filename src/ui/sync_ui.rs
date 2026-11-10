@@ -63,6 +63,7 @@ pub(super) struct SyncUi {
     merge_edit: Option<(String, String)>,
     merge_note_base: Option<serde_json::Value>,
     bridge_task: Option<crate::tasks::Task<Option<(String, SyncClient)>>>,
+    membership_task: Option<crate::tasks::Task<()>>,
     discovery: Option<crate::discovery::Discovery>,
     nearby: Vec<crate::discovery::NearbyNode>,
     discovery_error: Option<String>,
@@ -90,6 +91,7 @@ impl Default for SyncUi {
             merge_edit: None,
             merge_note_base: None,
             bridge_task: None,
+            membership_task: None,
             discovery:None,nearby:vec![],discovery_error:None,auto_connect:true,next_discovery:None,
             attempts:Default::default(),disconnected:Default::default(),
         }
@@ -467,6 +469,10 @@ impl InventoryApp {
         if !state.open {
             return;
         }
+        if let Some(result) = state.membership_task.as_ref().and_then(crate::tasks::Task::poll) {
+            state.membership_task = None;
+            state.error = result.err();
+        }
         if let Some(result) = state
             .bridge_task
             .as_ref()
@@ -719,16 +725,21 @@ impl InventoryApp {
             state.open = false;
             state.revoking_id = None;
         }
-        if let Some((public, revoke)) = membership_action {
-            let mut store = self.store.lock().unwrap();
-            let result = crate::network_identity::node_id(&public).and_then(|id| {
-                if !revoke && store.show_pairing_code(&id) {
-                    Ok(())
-                } else {
-                    store.network_authorize(public, revoke)
-                }
-            });
-            state.error = result.err().map(|error| error.to_string());
+        if let Some((public, revoke)) = membership_action
+            && state.membership_task.is_none()
+        {
+            let pairing = !revoke && crate::network_identity::node_id(&public).is_ok_and(|id|
+                self.store.lock().unwrap().show_pairing_code(&id));
+            if !pairing {
+                let store = std::sync::Arc::downgrade(&self.store);
+                let wake = ctx.clone();
+                state.membership_task = Some(crate::tasks::Task::spawn(
+                    move |_| crate::async_io::runtime()?.block_on(
+                        crate::component_sync::authorize_member(store, public, revoke),
+                    ),
+                    Box::new(move || wake.request_repaint()),
+                ));
+            }
         }
         if enable_component {
             state.error = crate::store::Store::enable_component(&self.store)

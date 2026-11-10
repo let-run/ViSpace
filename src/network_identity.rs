@@ -208,6 +208,26 @@ impl Membership {
         Ok(())
     }
 }
+pub(crate) fn membership_record(record: &crate::action_log::Record) -> Result<Option<Membership>> {
+    let Some(entry) = record.actions.iter().find(|a| a.entity == "network_membership") else {
+        return Ok(None);
+    };
+    ensure!(
+        record.actions.len() == 1 && record.mesh.as_ref().is_some_and(|meta|
+            meta.mutations.is_empty() && meta.resolutions.is_empty() && meta.receipts.is_empty()),
+        "Invalid network membership record"
+    );
+    let action: Membership = serde_json::from_value(entry.value.clone().context("Missing membership proof")?)?;
+    action.validate()?;
+    ensure!(
+        crate::network_identity::verify_record(record)? == action.issuer
+            && entry.key == action.subject
+            && entry.kind == if action.revoked { "node_revoked" } else { "node_approved" },
+        "Membership record does not match its signed action"
+    );
+    Ok(Some(action))
+}
+
 impl Ledger {
     pub fn merge(&mut self, actions: Vec<Membership>) -> Result<bool> {
         ensure!(
@@ -456,6 +476,13 @@ impl BrowserIdentity {
             Ok(serde_json::to_string(&peers)?)
         })().map_err(js_error)
     }
+    pub fn replay_membership(&mut self, records: &str) -> Result<bool, wasm_bindgen::JsValue> {
+        (|| -> Result<_> {
+            let records: Vec<crate::action_log::Record> = serde_json::from_str(records)?;
+            let actions = records.iter().map(membership_record).collect::<Result<Vec<_>>>()?;
+            self.ledger.merge_for(&self.id(), actions.into_iter().flatten().collect())
+        })().map_err(js_error)
+    }
     pub fn approve(
         &mut self,
         public: &str,
@@ -494,11 +521,16 @@ impl BrowserIdentity {
     }
     pub fn verify_record(&self, record: &str) -> Result<(), wasm_bindgen::JsValue> {
         (|| -> Result<_> {
-            ensure!(
-                self.ledger
-                    .allows_record(&self.id(), &serde_json::from_str(record)?)?,
-                "Unapproved or revoked action author"
-            );
+            let record = serde_json::from_str(record)?;
+            if !self.ledger.allows_record(&self.id(), &record)? {
+                let author = verify_record(&record)?;
+                let reason = if self.ledger.revoked(&self.id(), &author) {
+                    "revoked"
+                } else {
+                    "unapproved"
+                };
+                anyhow::bail!("Sync stopped: node {author} is {reason} (action {})", record.id);
+            }
             Ok(())
         })()
         .map_err(js_error)

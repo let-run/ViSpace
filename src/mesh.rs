@@ -345,7 +345,8 @@ impl Mesh {
             .values()
             .filter(|record| {
                 let meta = record.mesh.as_ref().unwrap();
-                (!meta.mutations.is_empty() || !meta.resolutions.is_empty())
+                (!meta.mutations.is_empty() || !meta.resolutions.is_empty()
+                    || record.actions.iter().any(|action| action.entity == "network_membership"))
                     && self
                         .clock
                         .get(&meta.origin)

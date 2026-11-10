@@ -1,5 +1,5 @@
 use crate::network_identity::{Identity, Ledger, Membership};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -192,16 +192,44 @@ impl crate::store::Store {
         self.security.ledger.revoked(self.application_id(), id)
     }
     pub fn network_authorize(&mut self, public: String, revoke: bool) -> Result<()> {
+        if !revoke && self.network_trusted(&crate::network_identity::node_id(&public)?) {
+            return Ok(());
+        }
+        self.commit_network_membership(public, revoke, None).map(|_| ())
+    }
+
+    // An outbound connection needs a local trust anchor before a shared history exists.
+    pub(crate) fn network_bootstrap_peer(&mut self, public: String) -> Result<()> {
+        let action = self.security.identity.membership(public, false)?;
+        if self.network_trusted(self.application_id())
+            && !self.network_trusted(&action.subject)
+            && !self.network_revoked(&action.subject)
+        {
+            self.network_merge(vec![action])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_network_membership(
+        &mut self,
+        public: String,
+        revoke: bool,
+        request_id: Option<&str>,
+    ) -> Result<crate::action_log::Record> {
+        if self.uses_component() {
+            let leader = self.component_leader();
+            ensure!(
+                leader.as_deref() == Some(self.application_id()) && !self.component_locked(),
+                "The current sync leader must commit membership changes"
+            );
+        }
         ensure!(
             self.network_trusted(self.application_id()),
             "This identity has been revoked"
         );
         let mut action = self.security.identity.membership(public, revoke)?;
-        if !revoke && self.network_trusted(&action.subject) {
-            return Ok(());
-        }
         if revoke {
-            for r in self.events_after(&Default::default())? {
+            for r in self.records_after(None)? {
                 if crate::network_identity::verify_record(&r)? == action.subject {
                     action
                         .accepted_records
@@ -216,7 +244,22 @@ impl crate::store::Store {
             action.subject != self.application_id(),
             "Cannot change your own membership"
         );
-        self.network_merge(vec![action])
+        let mut record = self.make_membership_record()?;
+        if let Some(id) = request_id {
+            record.id = id.to_owned();
+        }
+        record.actions.push(crate::action_log::Action {
+            kind: if revoke { "node_revoked" } else { "node_approved" }.into(),
+            entity: "network_membership".into(),
+            key: action.subject.clone(),
+            label: action.subject.clone(),
+            value: Some(serde_json::to_value(action)?),
+            changes: vec![],
+            position: None,
+        });
+        self.security.identity.sign_record(&mut record)?;
+        self.replay_record(&record, None)?;
+        Ok(record)
     }
     pub fn network_verify_record(&self, record: &crate::action_log::Record) -> Result<()> {
         ensure!(

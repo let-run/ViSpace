@@ -220,6 +220,10 @@ impl Store {
         }
         tx.commit()?;
         store.history = store.mesh.missing(&crate::mesh::Clock::new());
+        let membership = store.history.iter()
+            .map(crate::network_identity::membership_record)
+            .collect::<Result<Vec<_>>>()?;
+        store.network_merge(membership.into_iter().flatten().collect())?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS sync_pending_proposal(singleton INTEGER PRIMARY KEY CHECK(singleton=1), payload TEXT NOT NULL);")?;
         let migrate = !component
             && (legacy_db.is_some() || store.path.with_extension("consensus.json").exists());
@@ -303,6 +307,7 @@ impl Store {
         self.journal.page(before, limit)
     }
     fn ensure_writable(&self) -> Result<()> {
+        ensure!(self.network_trusted(self.application_id()), "This node has been revoked");
         ensure!(
             self.pending_proposal()?.is_none(),
             "Review the pending draft in Sync before saving another change"
@@ -348,6 +353,7 @@ impl Store {
         previous: Option<&str>,
     ) -> Result<bool> {
         self.network_verify_record(record)?;
+        let membership = crate::network_identity::membership_record(record)?;
         ensure!(
             !self.recovery_required(),
             "Restart the application to recover its action log"
@@ -393,6 +399,12 @@ impl Store {
         }
         self.data = next;
         self.history.push(record.clone());
+        if let Some(action) = membership {
+            if let Err(error) = self.network_merge(vec![action]) {
+                self.journal.failed = true;
+                return Err(error.context("Membership change is logged; restart to recover it"));
+            }
+        }
         self.revision = self.revision.wrapping_add(1);
         self.changes.send_replace(self.revision);
         if !self.auto_merging && !self.uses_component() {
@@ -485,6 +497,16 @@ impl Store {
 
     pub fn uses_component(&self) -> bool {
         self.component.is_some()
+    }
+    pub(crate) fn component_locked(&self) -> bool {
+        self.component.as_ref().is_some_and(|state| state.locked()) || !self.reviews.is_empty()
+    }
+    pub(crate) fn make_membership_record(&self) -> Result<crate::action_log::Record> {
+        // Membership commits have a separate origin from queued component drafts.
+        let origin = self.application_id.as_str();
+        let sequence = self.mesh.clock.get(origin).copied().unwrap_or(0)
+            .checked_add(1).context("Origin sequence exhausted")?;
+        self.mesh.make(&self.data, &self.data, &self.attachment_root(), origin, sequence)
     }
 
     pub fn enable_component(store: &SharedStore) -> Result<()> {
@@ -601,7 +623,31 @@ impl Store {
         &mut self,
         draft: &crate::action_log::Record,
     ) -> Result<crate::component_sync::Approval> {
-        self.network_verify_record(draft)?;
+        let author = crate::network_identity::verify_record(draft)?;
+        ensure!(self.network_trusted(&author), "The proposal author is unapproved or revoked");
+        if let [action] = draft.actions.as_slice()
+            && action.entity == "network_membership_request"
+        {
+            use crate::component_sync::{Approval, SaveResult};
+            ensure!(draft.mesh.as_ref().is_some_and(|meta| meta.mutations.is_empty()
+                && meta.resolutions.is_empty() && meta.receipts.is_empty()), "Invalid membership proposal");
+            let public = action.value.as_ref().and_then(serde_json::Value::as_str)
+                .context("Missing proposed member key")?;
+            ensure!(crate::network_identity::node_id(public)? != author, "Cannot change your own membership");
+            let revoke = match action.kind.as_str() {
+                "revoke" => true,
+                "approve" => false,
+                _ => anyhow::bail!("Invalid membership proposal"),
+            };
+            if let Some(existing) = self.mesh.events.get(&draft.id) {
+                let membership = crate::network_identity::membership_record(existing)?
+                    .context("Membership proposal ID was reused")?;
+                ensure!(membership.public_key == public && membership.revoked == revoke, "Membership proposal ID was reused");
+                return Ok(Approval { result: SaveResult::Committed, record: Some(existing.clone()) });
+            }
+            let record = self.commit_network_membership(public.to_owned(), revoke, Some(&draft.id))?;
+            return Ok(Approval { result: SaveResult::Committed, record: Some(record) });
+        }
         let approval = self.validate_component_proposal(draft)?;
         if let Some(record) = &approval.record {
             self.replay_record(record, None)?;
@@ -635,6 +681,19 @@ impl Store {
             });
         }
         let meta = draft.mesh.as_ref().context("Missing proposal context")?;
+        ensure!(self.network_trusted(meta.author()), "The proposal author is unapproved or revoked");
+        // A draft from an earlier membership period must not be revived by reapproval.
+        if self.history.iter().any(|record| {
+            record.actions.iter().any(|action| {
+                action.entity == "network_membership" && action.key == meta.author()
+            }) && record.mesh.as_ref().is_some_and(|membership| {
+                meta.context.get(&membership.origin).copied().unwrap_or(0) < membership.sequence
+            })
+        }) {
+            return Ok(outcome(SaveResult::Invalid(
+                "The draft predates a membership change. Sync before editing again.".into(),
+            )));
+        }
         if !meta
             .context
             .iter()
