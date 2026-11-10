@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, Linux, X64, vispace-release]
+    runs-on: [vispace-release]
     steps:
       - uses: actions/checkout@v4
       - name: Install browser target
